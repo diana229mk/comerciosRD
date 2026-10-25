@@ -1,0 +1,222 @@
+/*
+ |--------------------------------------------------------------------------
+ | ComerciosRD · Tema del panel del dueño (admin)
+ |--------------------------------------------------------------------------
+ | Solo aplica al AdminPanelProvider (path /admin). Es puramente cosmético:
+ | ajusta tokens de diseño de Filament sin tocar HTML ni lógica.
+ |
+ | Estructura:
+ |   1) Tokens (colores de acento, radios, sombras, superficies)
+ |   2) Layout global (topbar, sidebar, contenido)
+ |   3) Componentes (tarjetas, botones, badges, inputs, tablas)
+ |   4) Dashboard (widgets, encabezado)
+ |   5) Modo oscuro y accesibilidad
+ |
+ | Para escalar: añadir variables en :root y su equivalente en .dark. Evitar
+ | selectores muy específicos; usar las clases .fi-* que expone Filament.
+ */
+
+/* ==========================================================================
+   1) Tokens de diseño
+   ========================================================================== */
+:root {
+    --crd-radius-sm: 0.5rem;
+    --crd-radius-md: 0.75rem;
+    --crd-radius-lg: 1rem;
+
+    --crd-shadow-sm: 0 1px 2px rgb(15 23 42 / 0.04), 0 1px 3px rgb(15 23 42 / 0.06);
+    --crd-shadow-md: 0 4px 8px -2px rgb(15 23 42 / 0.06), 0 6px 20px -6px rgb(15 23 42 / 0.10);
+    --crd-shadow-lg: 0 10px 24px -8px rgb(15 23 42 / 0.12), 0 20px 40px -12px rgb(15 23 42 / 0.16);
+
+    --crd-surface: #ffffff;
+    --crd-surface-muted: #f8fafc;
+    --crd-surface-hover: #f1f5f9;
+    --crd-border: #e2e8f0;
+    --crd-border-strong: #cbd5e1;
+
+    /* Acento cálido, coherente con primary=Amber ya configurado en el panel */
+    --crd-accent-gradient: linear-gradient(135deg, #f59e0b 0%, #ef4444 100%);
+    --crd-accent-soft: linear-gradient(135deg, rgba(245, 158, 11, 0.10), rgba(239, 68, 68, 0.06));
+
+    --crd-ease: cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.dark {
+    --crd-surface: #0f172a;
+    --crd-surface-muted: #1e293b;
+    --crd-surface-hover: #263449;
+    --crd-border: #334155;
+    --crd-border-strong: #475569;
+
+    --crd-shadow-sm: 0 1px 2px rgb(0 0 0 / 0.30);
+    --crd-shadow-md: 0 4px 12px -2px rgb(0 0 0 / 0.35);
+    --crd-shadow-lg: 0 12px 28px -8px rgb(0 0 0 / 0.45);
+
+    --crd-accent-soft: linear-gradient(135deg, rgba(245, 158, 11, 0.18), rgba(239, 68, 68, 0.10));
+}
+
+/* ==========================================================================
+   2) Layout global
+   ========================================================================== */
+
+.fi-topbar {
+    backdrop-filter: saturate(140%) blur(8px);
+    border-bottom: 1px solid var(--crd-border);
+    box-shadow: var(--crd-shadow-sm);
+}
+
+/* Marca del panel (brandName con acento cálido) */
+.fi-topbar-item .fi-logo,
+.fi-sidebar-header .fi-logo {
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    background: var(--crd-accent-gradient);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+}
+
+.fi-sidebar {
+    border-right: 1px solid var(--crd-border);
+}
+
+.fi-sidebar-group-label {
+    text-transform: uppercase;
+    font-size: 0.7rem;
+    letter-spacing: 0.06em;
+    opacity: 0.7;
+}
+
+.fi-sidebar-item-button {
+    border-radius: var(--crd-radius-md);
+    transition: background-color 150ms var(--crd-ease), color 150ms var(--crd-ease);
+}
+
+.fi-sidebar-item-button:hover {
+    background: var(--crd-surface-hover);
+}
+
+.fi-sidebar-item-active > .fi-sidebar-item-button {
+    background: var(--crd-accent-soft);
+    font-weight: 600;
+}
+
+.fi-main {
+    background: var(--crd-surface-muted);
+}
+
+/* ==========================================================================
+   3) Componentes
+   ========================================================================== */
+
+.fi-section,
+.fi-wi-stats-overview-stat,
+.fi-fo-section,
+.fi-ta-ctn {
+    border-radius: var(--crd-radius-lg);
+    box-shadow: var(--crd-shadow-sm);
+    transition: box-shadow 200ms var(--crd-ease), transform 200ms var(--crd-ease);
+}
+
+.fi-wi-stats-overview-stat:hover {
+    box-shadow: var(--crd-shadow-md);
+    transform: translateY(-1px);
+}
+
+.fi-btn {
+    border-radius: var(--crd-radius-md);
+    font-weight: 600;
+    transition: transform 120ms var(--crd-ease), box-shadow 160ms var(--crd-ease);
+}
+
+.fi-btn:hover:not(:disabled) {
+    box-shadow: var(--crd-shadow-sm);
+}
+
+.fi-btn:active:not(:disabled) {
+    transform: translateY(1px);
+}
+
+.fi-badge {
+    border-radius: 9999px;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+}
+
+.fi-input,
+.fi-select-input,
+.fi-textarea-input {
+    border-radius: var(--crd-radius-md);
+    transition: border-color 140ms var(--crd-ease), box-shadow 140ms var(--crd-ease);
+}
+
+.fi-ta-header-cell {
+    background: var(--crd-surface-muted);
+    font-weight: 600;
+    letter-spacing: 0.01em;
+}
+
+.fi-ta-row {
+    transition: background-color 120ms var(--crd-ease);
+}
+
+.fi-ta-row:hover {
+    background: var(--crd-surface-hover);
+}
+
+.fi-modal-window {
+    border-radius: var(--crd-radius-lg);
+    box-shadow: var(--crd-shadow-lg);
+}
+
+/* ==========================================================================
+   4) Dashboard
+   ========================================================================== */
+
+.fi-page-heading {
+    letter-spacing: -0.02em;
+    font-weight: 700;
+}
+
+.fi-page-subheading {
+    opacity: 0.85;
+}
+
+.fi-wi-stats-overview-stat-value {
+    font-weight: 700;
+    letter-spacing: -0.02em;
+}
+
+.fi-wi-stats-overview-stat-description {
+    opacity: 0.75;
+}
+
+.fi-wi-chart {
+    padding: 0.25rem;
+}
+
+/* ==========================================================================
+   5) Accesibilidad y detalles
+   ========================================================================== */
+
+@media (prefers-reduced-motion: reduce) {
+    .fi-btn,
+    .fi-sidebar-item-button,
+    .fi-ta-row,
+    .fi-wi-stats-overview-stat,
+    .fi-section {
+        transition: none !important;
+    }
+}
+
+.fi-sidebar-nav::-webkit-scrollbar,
+.fi-ta-ctn::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+
+.fi-sidebar-nav::-webkit-scrollbar-thumb,
+.fi-ta-ctn::-webkit-scrollbar-thumb {
+    background: var(--crd-border-strong);
+    border-radius: 8px;
+}
