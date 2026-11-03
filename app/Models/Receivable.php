@@ -158,7 +158,7 @@ class Receivable extends Model
     }
 
     /**
-     * Registra un cobro, actualiza estado y, si es efectivo, suma a la caja abierta.
+     * Registra un cobro de forma atómica (lockForUpdate) para evitar sobrepagos concurrentes (DATA-02).
      */
     public function registerPayment(
         float $amount,
@@ -173,41 +173,48 @@ class Receivable extends Model
             throw new \InvalidArgumentException('El monto del cobro debe ser mayor que cero.');
         }
 
-        $max = round((float) $this->balance, 2);
-        if ($max <= 0) {
-            throw new \RuntimeException('Esta cuenta ya está cobrada.');
-        }
+        return $this->getConnection()->transaction(function () use ($amount, $paymentMethod, $paymentDate, $reference, $notes, $updateCashSession) {
+            /** @var self $locked */
+            $locked = static::query()->whereKey($this->getKey())->lockForUpdate()->firstOrFail();
 
-        if ($amount > $max + 0.001) {
-            throw new \InvalidArgumentException(
-                'El cobro (RD$ '.number_format($amount, 2).') supera el saldo pendiente (RD$ '.number_format($max, 2).').'
-            );
-        }
+            $max = round((float) $locked->balance, 2);
+            if ($max <= 0) {
+                throw new \RuntimeException('Esta cuenta ya está cobrada.');
+            }
 
-        $payment = new ReceivablePayment([
-            'receivable_id' => $this->id,
-            'amount' => $amount,
-            'payment_method' => $paymentMethod,
-            'payment_date' => $paymentDate ?: now()->toDateString(),
-            'reference' => $reference,
-            'notes' => $notes,
-            'created_by' => auth()->id(),
-        ]);
-        $payment->business_id = $this->business_id;
-        $payment->save();
+            if ($amount > $max + 0.001) {
+                throw new \InvalidArgumentException(
+                    'El cobro (RD$ '.number_format($amount, 2).') supera el saldo pendiente (RD$ '.number_format($max, 2).').'
+                );
+            }
 
-        if ($updateCashSession && in_array(strtolower($paymentMethod), ['efectivo', 'cash'], true)) {
-            app(CashSessionService::class)->registerCashAmount(
-                (string) $this->business_id,
-                $amount,
-                now(),
-                auth()->id() ? (string) auth()->id() : null,
-            );
-        }
+            $payment = new ReceivablePayment([
+                'receivable_id' => $locked->id,
+                'amount' => $amount,
+                'payment_method' => $paymentMethod,
+                'payment_date' => $paymentDate ?: now()->toDateString(),
+                'reference' => $reference,
+                'notes' => $notes,
+                'created_by' => auth()->id(),
+            ]);
+            $payment->business_id = $locked->business_id;
+            $payment->save();
 
-        $this->refresh();
+            if ($updateCashSession && in_array(strtolower($paymentMethod), ['efectivo', 'cash'], true)) {
+                app(CashSessionService::class)->registerCashAmount(
+                    (string) $locked->business_id,
+                    $amount,
+                    now(),
+                    auth()->id() ? (string) auth()->id() : null,
+                );
+            }
 
-        return $payment;
+            $locked->refresh();
+            $this->setRawAttributes($locked->getAttributes());
+            $this->syncOriginal();
+
+            return $payment;
+        });
     }
 
     protected static function booted(): void
