@@ -23,9 +23,8 @@ services:
       retries: 20
       start_period: 20s
 
+  # Always defined so other profiles can depend on it without validation errors
   test-redis:
-    profiles:
-      - accounting-testing
     image: redis:7.4-alpine
     restart: "no"
     command:
