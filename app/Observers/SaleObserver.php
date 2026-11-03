@@ -4,17 +4,22 @@ namespace App\Observers;
 
 use App\Enums\PaymentMethod;
 use App\Enums\SaleStatus;
-use App\Models\Customer;
+use App\Jobs\IssueElectronicInvoiceJob;
+use App\Jobs\PostSaleAccountingJob;
+use App\Models\Business;
 use App\Models\InventoryMovement;
 use App\Models\Product;
-use App\Models\Receivable;
+use App\Models\ProductVariant;
 use App\Models\Sale;
-use App\Jobs\IssueElectronicInvoiceJob;
-use App\Support\EcfFeature;
-use App\Jobs\PostSaleAccountingJob;
+use App\Services\AccountingOutboxService;
 use App\Services\CashSessionService;
 use App\Services\InventoryService;
+use App\Services\KitchenInventoryService;
+use App\Services\KitchenTicketService;
+use App\Services\SaleCreditService;
+use App\Services\SaleFinancialIntegrity;
 use App\Services\SalesDailySummaryService;
+use App\Support\EcfFeature;
 use Filament\Notifications\Notification;
 use Illuminate\Support\Facades\Log;
 use RuntimeException;
@@ -90,8 +95,11 @@ class SaleObserver
             return;
         }
 
+        app(AccountingOutboxService::class)->register($sale);
+
         // Solo si los ítems ya están cargados (evita caja/contabilidad sin líneas)
-        if ($sale->relationLoaded('items') && $sale->items->isNotEmpty()) {
+        if ($sale->relationLoaded('items') && $sale->items->isNotEmpty()
+            && ! ($sale->isCreditSale() && app(SaleFinancialIntegrity::class)->isConstructing($sale))) {
             $this->processCompletedSale($sale, skipInventory: false);
         }
     }
@@ -103,6 +111,7 @@ class SaleObserver
     {
         // Completada: inventario + contabilidad + caja
         if ($sale->wasChanged('status') && $this->statusIsCompleted($sale->status)) {
+            app(AccountingOutboxService::class)->register($sale, resumeSkipped: true);
             $sale->loadMissing('items');
             $this->processCompletedSale($sale);
         }
@@ -119,6 +128,26 @@ class SaleObserver
      * Público para que SaleService lo invoque tras guardar los ítems.
      */
     public function processCompletedSale(Sale $sale, bool $skipInventory = false): void
+    {
+        app(SaleFinancialIntegrity::class)->assertBusiness((string) $sale->business_id);
+        $sale->getConnection()->transaction(function () use ($sale, $skipInventory): void {
+            $locked = Sale::withoutBusinessScope()->where('business_id', $sale->business_id)
+                ->whereKey($sale->id)->lockForUpdate()->firstOrFail();
+            if (! $locked->isCompleted()) {
+                return;
+            }
+            if ($locked->isCreditSale()) {
+                app(SaleCreditService::class)->complete(
+                    $locked, fn (Sale $source) => $this->applyCompletedEffects($source, $skipInventory),
+                );
+
+                return;
+            }
+            $this->applyCompletedEffects($locked, $skipInventory);
+        });
+    }
+
+    protected function applyCompletedEffects(Sale $sale, bool $skipInventory): void
     {
         if (! $this->statusIsCompleted($sale->status)) {
             return;
@@ -139,17 +168,14 @@ class SaleObserver
             $this->createInventoryMovements($sale);
 
             $business = $sale->business
-                ?? \App\Models\Business::query()->find($sale->business_id);
+                ?? Business::query()->find($sale->business_id);
             if ($business?->isCafeteria()) {
-                app(\App\Services\KitchenInventoryService::class)->consumeSaleRecipes($sale);
+                app(KitchenInventoryService::class)->consumeSaleRecipes($sale);
             }
         }
 
         // 3. Actualizar la caja abierta (solo efectivo) — síncrono: el cajero lo ve ya
         $this->updateOpenCashSession($sale);
-
-        // 4. Fiado / crédito → cuenta por cobrar (idempotente)
-        $this->createReceivableFromCreditSale($sale);
 
         // 5. Resumen diario O(1) para dashboards
         app(SalesDailySummaryService::class)->applyCompletedSale($sale);
@@ -163,77 +189,10 @@ class SaleObserver
         // 7. Cafetería: el cobro en caja manda el ticket a cocina (si no nació de una orden).
         if (! $skipInventory) {
             $business = $sale->business
-                ?? \App\Models\Business::query()->find($sale->business_id);
+                ?? Business::query()->find($sale->business_id);
             if ($business?->isCafeteria()) {
-                app(\App\Services\KitchenTicketService::class)->fromSale($sale);
+                app(KitchenTicketService::class)->fromSale($sale);
             }
-        }
-    }
-
-    /**
-     * Crea CxC cuando la venta es a crédito / fiado y hay cliente.
-     * Idempotente por reference = sale_number.
-     */
-    protected function createReceivableFromCreditSale(Sale $sale): void
-    {
-        if (! PaymentMethod::isCreditValue($sale->payment_method)) {
-            return;
-        }
-
-        if (! $sale->customer_id) {
-            Log::warning('SaleObserver: venta a crédito sin customer_id; no se creó CxC', [
-                'sale_id' => $sale->id,
-            ]);
-
-            return;
-        }
-
-        try {
-            $business = $sale->business
-                ?? \App\Models\Business::query()->find($sale->business_id);
-
-            if ($business && ! $business->hasModule('receivables')) {
-                return;
-            }
-
-            $saleNumber = $sale->sale_number ?: $sale->number ?: (string) $sale->id;
-            $reference = 'Venta '.$saleNumber;
-
-            $exists = Receivable::withoutBusinessScope()
-                ->where('business_id', $sale->business_id)
-                ->where('reference', $reference)
-                ->exists();
-
-            if ($exists) {
-                return;
-            }
-
-            $customerName = $sale->customer_name
-                ?? Customer::withoutBusinessScope()->whereKey($sale->customer_id)->value('name');
-
-            $type = $business?->business_type ?? 'general';
-            $label = $type === 'colmado' ? 'Fiado' : 'Crédito';
-
-            $receivable = new Receivable([
-                'customer_id' => $sale->customer_id,
-                'customer_name' => $customerName,
-                'reference' => $reference,
-                'description' => "{$label} venta #{$saleNumber}",
-                'amount' => $sale->total,
-                'paid_amount' => 0,
-                'balance' => $sale->total,
-                'status' => 'pendiente',
-                'due_date' => now()->addDays(7)->toDateString(),
-                'notes' => 'Generado automáticamente desde venta',
-                'created_by' => $sale->created_by ?? $sale->user_id ?? auth()->id(),
-            ]);
-            $receivable->business_id = $sale->business_id;
-            $receivable->save();
-        } catch (\Throwable $e) {
-            Log::warning('SaleObserver: no se pudo crear CxC de fiado/crédito', [
-                'sale_id' => $sale->id,
-                'error' => $e->getMessage(),
-            ]);
         }
     }
 
@@ -295,7 +254,7 @@ class SaleObserver
 
             $variant = null;
             if ($item->variant_id) {
-                $variant = \App\Models\ProductVariant::withoutBusinessScope()
+                $variant = ProductVariant::withoutBusinessScope()
                     ->where('business_id', $sale->business_id)
                     ->whereKey($item->variant_id)
                     ->first();
@@ -369,7 +328,7 @@ class SaleObserver
 
             $variant = null;
             if (! empty($item->variant_id)) {
-                $variant = \App\Models\ProductVariant::withoutBusinessScope()
+                $variant = ProductVariant::withoutBusinessScope()
                     ->where('business_id', $sale->business_id)
                     ->whereKey($item->variant_id)
                     ->first();

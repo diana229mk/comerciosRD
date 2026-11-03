@@ -4,12 +4,14 @@ namespace App\Services;
 
 use App\Models\Business;
 use App\Models\Product;
+use App\Models\ProductVariant;
 use App\Models\Quote;
 use App\Models\QuoteItem;
 use App\Models\Sale;
 use App\Support\Itbis;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 use InvalidArgumentException;
 
@@ -29,48 +31,50 @@ class QuoteService
         return DB::transaction(function () use ($data) {
             $businessId = $data['business_id'] ?? auth()->user()?->current_business_id;
             if (! $businessId) {
-                throw new \InvalidArgumentException('business_id requerido para crear cotización.');
+                throw new InvalidArgumentException('business_id requerido para crear cotización.');
             }
 
             $quote = Quote::create([
-                'code'          => $data['code'] ?? $this->nextCode($businessId),
-                'customer_id'   => $data['customer_id'] ?? null,
+                'code' => $data['code'] ?? $this->nextCode($businessId),
+                'customer_id' => $data['customer_id'] ?? null,
                 'customer_name' => $data['customer_name'] ?? null,
                 'price_list_id' => $data['price_list_id'] ?? null,
-                'status'        => 'draft',
-                'issue_date'    => $data['issue_date'] ?? Carbon::today(),
-                'valid_until'   => $data['valid_until'] ?? Carbon::today()->addDays(15),
-                'notes'         => $data['notes'] ?? null,
-                'created_by'    => $data['created_by'] ?? auth()->id(),
-                'subtotal'      => 0, 'discount' => 0, 'tax' => 0, 'total' => 0,
+                'status' => 'draft',
+                'issue_date' => $data['issue_date'] ?? Carbon::today(),
+                'valid_until' => $data['valid_until'] ?? Carbon::today()->addDays(15),
+                'notes' => $data['notes'] ?? null,
+                'created_by' => $data['created_by'] ?? auth()->id(),
+                'subtotal' => 0, 'discount' => 0, 'tax' => 0, 'total' => 0,
             ]);
 
             $subtotal = 0.0;
             foreach ($data['items'] ?? [] as $line) {
                 $product = Product::find($line['product_id']);
-                if (! $product) continue;
+                if (! $product) {
+                    continue;
+                }
                 $qty = (float) ($line['quantity'] ?? 1);
                 $price = (float) ($line['unit_price'] ?? $product->price);
                 $sub = round($qty * $price, 2);
 
                 QuoteItem::create([
-                    'quote_id'     => $quote->id,
-                    'product_id'   => $product->id,
-                    'variant_id'   => $line['variant_id'] ?? null,
+                    'quote_id' => $quote->id,
+                    'product_id' => $product->id,
+                    'variant_id' => $line['variant_id'] ?? null,
                     'product_name' => $line['product_name'] ?? $product->name,
-                    'unit_id'      => $line['unit_id'] ?? null,
-                    'unit_code'    => $line['unit_code'] ?? $product->unit,
-                    'quantity'     => $qty,
-                    'unit_price'   => $price,
-                    'subtotal'     => $sub,
+                    'unit_id' => $line['unit_id'] ?? null,
+                    'unit_code' => $line['unit_code'] ?? $product->unit,
+                    'quantity' => $qty,
+                    'unit_price' => $price,
+                    'subtotal' => $sub,
                 ]);
                 $subtotal += $sub;
             }
 
             $discount = (float) ($data['discount'] ?? 0);
-            $taxable  = max($subtotal - $discount, 0);
-            $tax      = round($taxable * ((float) ($data['tax_rate'] ?? 0.18)), 2);
-            $total    = round($taxable + $tax, 2);
+            $taxable = max($subtotal - $discount, 0);
+            $tax = round($taxable * ((float) ($data['tax_rate'] ?? 0.18)), 2);
+            $total = round($taxable + $tax, 2);
 
             $quote->update([
                 'subtotal' => $subtotal, 'discount' => $discount,
@@ -84,18 +88,21 @@ class QuoteService
     public function send(Quote $q): Quote
     {
         $q->update(['status' => 'sent']);
+
         return $q;
     }
 
     public function accept(Quote $q): Quote
     {
         $q->update(['status' => 'accepted']);
+
         return $q;
     }
 
     public function reject(Quote $q): Quote
     {
         $q->update(['status' => 'rejected']);
+
         return $q;
     }
 
@@ -104,34 +111,48 @@ class QuoteService
      */
     public function convertToSale(Quote $quote, array $overrides = []): Sale
     {
-        return DB::transaction(function () use ($quote, $overrides) {
-            $items = $quote->items->map(fn ($i) => [
-                'product_id'  => $i->product_id,
-                'variant_id'  => $i->variant_id,
-                'unit_id'     => $i->unit_id,
-                'unit_code'   => $i->unit_code,
-                'quantity'    => (float) $i->quantity,
-                'unit_price'  => (float) $i->unit_price,
-                'product_name'=> $i->product_name,
-            ])->all();
+        $businessId = (string) $quote->business_id;
+        app(SaleFinancialIntegrity::class)->assertBusiness($businessId);
 
-            $sale = $this->sales->create(array_merge([
-                'business_id'   => $quote->business_id,
-                'customer_id'   => $quote->customer_id,
-                'customer_name' => $quote->customer_name,
-                'price_list_id' => $quote->price_list_id,
-                'quote_id'      => $quote->id,
-                'items'         => $items,
-                'notes'         => 'Convertida desde cotización '.$quote->code,
-            ], $overrides));
+        return app(SaleCheckout::class)->run($businessId, 'quote:'.$quote->id,
+            ['entry' => 'quote', 'id' => $quote->id, 'overrides' => $overrides], function () use ($quote, $overrides, $businessId) {
+                $quote = Quote::withoutBusinessScope()->where('business_id', $businessId)
+                    ->whereKey($quote->id)->lockForUpdate()->firstOrFail();
+                if ($quote->converted_sale_id) {
+                    throw new InvalidArgumentException('La cotización ya tiene una venta.');
+                }
+                if (isset($overrides['business_id']) && (string) $overrides['business_id'] !== $businessId) {
+                    abort(404);
+                }
+                $items = $quote->items->map(fn ($i) => [
+                    'product_id' => $i->product_id,
+                    'variant_id' => $i->variant_id,
+                    'unit_id' => $i->unit_id,
+                    'unit_code' => $i->unit_code,
+                    'quantity' => (float) $i->quantity,
+                    'unit_price' => (float) $i->unit_price,
+                    'product_name' => $i->product_name,
+                ])->all();
 
-            $quote->update([
-                'status'            => 'converted',
-                'converted_sale_id' => $sale->id,
-            ]);
+                $sale = $this->sales->create(array_merge([
+                    'business_id' => $quote->business_id,
+                    'customer_id' => $quote->customer_id,
+                    'customer_name' => $quote->customer_name,
+                    'price_list_id' => $quote->price_list_id,
+                    'quote_id' => $quote->id,
+                    'items' => $items,
+                    'notes' => 'Convertida desde cotización '.$quote->code,
+                ], $overrides));
 
-            return $sale;
-        });
+                if (! $quote->update([
+                    'status' => 'converted',
+                    'converted_sale_id' => $sale->id,
+                ])) {
+                    throw new \RuntimeException('No se pudo confirmar la conversión de la cotización.');
+                }
+
+                return $sale;
+            });
     }
 
     /**
@@ -252,7 +273,7 @@ class QuoteService
             $variantId = $row['variant_id'] ?? null;
             $variant = null;
             if ($variantId) {
-                $variant = \App\Models\ProductVariant::query()
+                $variant = ProductVariant::query()
                     ->where('business_id', $business->getKey())
                     ->where('product_id', $product->getKey())
                     ->whereKey($variantId)
@@ -272,7 +293,7 @@ class QuoteService
                 'unit_price' => $price,
                 'subtotal' => round($qty * $price, 2),
             ];
-            if (\Illuminate\Support\Facades\Schema::hasColumn('quote_items', 'oem_code')) {
+            if (Schema::hasColumn('quote_items', 'oem_code')) {
                 $line['oem_code'] = $product->oem_code;
             }
             $prepared[] = $line;
@@ -307,7 +328,7 @@ class QuoteService
                 'tax' => $totals['tax'],
                 'total' => $totals['total'],
             ]);
-            if (\Illuminate\Support\Facades\Schema::hasColumn('quotes', 'tax_rate')) {
+            if (Schema::hasColumn('quotes', 'tax_rate')) {
                 $quote->forceFill(['tax_rate' => $taxRate]);
             }
             $quote->save();
@@ -322,10 +343,16 @@ class QuoteService
 
     public function markConverted(Quote $quote, Sale $sale): void
     {
-        $quote->forceFill([
+        if ((string) $quote->business_id !== (string) $sale->business_id
+            || ($quote->converted_sale_id && (string) $quote->converted_sale_id !== (string) $sale->id)) {
+            throw new InvalidArgumentException('El origen de la venta no coincide con la cotización.');
+        }
+        if (! $quote->forceFill([
             'status' => Quote::STATUS_CONVERTED,
             'converted_sale_id' => $sale->id,
-        ])->save();
+        ])->save()) {
+            throw new \RuntimeException('No se pudo confirmar la conversión de la cotización.');
+        }
     }
 
     protected function nextCode(string $businessId): string
@@ -335,6 +362,7 @@ class QuoteService
             ->where('business_id', $businessId)
             ->whereDate('created_at', Carbon::today())
             ->count() + 1;
+
         return 'COT-'.$today.'-'.Str::padLeft((string) $count, 4, '0');
     }
 }

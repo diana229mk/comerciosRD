@@ -8,6 +8,8 @@ class SecurityHeadersTest extends TestCase
 {
     public function test_security_headers_present_on_admin_login(): void
     {
+        $this->withoutVite();
+
         config([
             'security.csp.enabled' => true,
             'security.headers.x_frame_options' => 'DENY',

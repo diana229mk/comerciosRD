@@ -12,6 +12,14 @@ pero debe usar una URL, claves, base de datos, Redis, bucket, correo, usuarios
 y datos completamente distintos. No copiar el `.env`, `APP_KEY`, backups ni
 datos de clientes desde producción.
 
+INF-06 introduce TLS MySQL fail-closed en runtime `production`; pasó
+72 pruebas/281 aserciones y cuatro checks Oracle en Docker aislado.
+No acredita el runtime de staging. Montar su CA en lectura en web,
+workers, scheduler y portabilidad, y usar un hostname cubierto por el
+certificado, sin reutilizar certificados desechables de pruebas. Véase
+[mysql-tls.md](mysql-tls.md). No iniciar staging sin cerrar los bloqueadores
+pendientes y aprobar por separado la configuración de sus recursos.
+
 ## Recursos que crear al escoger proveedor
 
 - Hostname HTTPS de staging, por ejemplo `staging.tudominio.com`; mantener
@@ -71,8 +79,20 @@ producción.
 Después del deploy, iniciar/supervisar workers:
 
 ```bash
-php artisan queue:work --queue=sales,reports,default --tries=3 --timeout=120
+php artisan queue:work redis --queue=sales,reports,default --sleep=3 --tries=3 --timeout=90 --max-time=3600 --memory=256
 ```
+
+Las colas deben coincidir con `SCALE_QUEUE_SALES`, `SCALE_QUEUE_REPORTS` y
+`REDIS_QUEUE` de los productores, incluso con nombres personalizados.
+Usar `REDIS_QUEUE_RETRY_AFTER=180`, timeout de 90 s y al menos 120 s de
+gracia de apagado. El supervisor debe reiniciar el proceso al salir,
+incluidas las salidas normales por `--max-time`.
+
+INF-04 incorpora un outbox SQL y recuperación independiente de Redis mediante
+el scheduler. Su validación aislada terminó con 53 pruebas/768 aserciones, cero
+fallos; no autoriza este despliegue. Antes de planificar el rollout, revisar
+[accounting-outbox.md](accounting-outbox.md), el tratamiento del legado y las
+dos tablas nuevas. No ejecutar el migrador completo ni migraciones históricas.
 
 Verificar `php artisan queue:failed`, logs y endpoints de salud. Probar login,
 2FA, permisos tenant, búsqueda, venta de prueba, inventario, recibos, backups y

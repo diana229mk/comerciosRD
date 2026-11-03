@@ -5,11 +5,13 @@ namespace App\Services;
 use App\Enums\PaymentMethod;
 use App\Enums\SaleStatus;
 use App\Models\Account;
+use App\Models\AccountingOutbox;
 use App\Models\Business;
 use App\Models\Expense;
 use App\Models\JournalEntry;
 use App\Models\JournalEntryLine;
 use App\Models\Sale;
+use App\Support\TenantContext;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
@@ -56,7 +58,8 @@ class AccountingService
                 'is_active' => true,
             ]);
             $model->business_id = $business->getKey();
-            $model->save();
+            // Provisioning is explicitly tenant-targeted; ambient Filament context must not rewrite it.
+            $model->saveQuietly();
         }
     }
 
@@ -73,153 +76,202 @@ class AccountingService
     public static function createFromSale(Sale $sale): void
     {
         try {
-            if (! self::saleIsCompleted($sale)) {
-                return;
-            }
+            TenantContext::run((string) $sale->business_id, function () use ($sale): void {
+                DB::transaction(function () use ($sale): void {
+                    $sale = Sale::withoutBusinessScope()
+                        ->where('business_id', $sale->business_id)
+                        ->whereKey($sale->getKey())
+                        ->lockForUpdate()
+                        ->firstOrFail();
 
-            $saleNumber = $sale->sale_number ?: $sale->number ?: $sale->id;
-            $reference = 'Venta #'.$saleNumber;
-
-            $exists = JournalEntry::withoutBusinessScope()
-                ->where('business_id', $sale->business_id)
-                ->where('reference', $reference)
-                ->exists();
-
-            if ($exists) {
-                return;
-            }
-
-            $sale->loadMissing(['items.product']);
-
-            DB::transaction(function () use ($sale, $reference, $saleNumber): void {
-                $accounts = Account::withoutBusinessScope()
-                    ->where('business_id', $sale->business_id)
-                    ->where('is_system', true)
-                    ->get()
-                    ->keyBy('code');
-
-                // Si no hay plan de cuentas, no fallar la venta
-                if ($accounts->isEmpty()) {
-                    Log::warning('AccountingService: sin cuentas del sistema para la venta', [
-                        'sale_id' => $sale->id,
-                        'business_id' => $sale->business_id,
-                    ]);
-
-                    return;
-                }
-
-                $paymentAccountCode = self::paymentAccountCode($sale->payment_method);
-                $paymentAccount = $accounts[$paymentAccountCode] ?? null;
-                $salesAccount = $accounts['4101'] ?? null;
-                $taxAccount = $accounts['2201'] ?? null;
-                $cogsAccount = $accounts['5101'] ?? null;
-                $inventoryAccount = $accounts['1301'] ?? null;
-
-                if (! $paymentAccount || ! $salesAccount) {
-                    Log::warning('AccountingService: faltan cuentas Caja/Ventas', [
-                        'sale_id' => $sale->id,
-                        'business_id' => $sale->business_id,
-                    ]);
-
-                    return;
-                }
-
-                $entry = new JournalEntry([
-                    'date' => $sale->sale_date?->toDateString()
-                        ?? $sale->sold_at?->toDateString()
-                        ?? now()->toDateString(),
-                    'reference' => $reference,
-                    'description' => 'Asiento automático por venta '.$saleNumber,
-                    'status' => JournalEntry::STATUS_POSTED,
-                    'created_by' => $sale->created_by ?? $sale->user_id,
-                    'total_debit' => 0,
-                    'total_credit' => 0,
-                ]);
-                $entry->business_id = $sale->business_id;
-                $entry->save();
-
-                $totalDebit = 0.0;
-                $totalCredit = 0.0;
-
-                $total = round((float) $sale->total, 2);
-                $tax = round((float) $sale->tax, 2);
-                // Ventas netas = total - ITBIS (equivale a subtotal - descuento)
-                $salesCredit = round($total - $tax, 2);
-
-                // 1. Débito: Caja / Banco / CxC
-                JournalEntryLine::create([
-                    'journal_entry_id' => $entry->id,
-                    'account_id' => $paymentAccount->id,
-                    'debit' => $total,
-                    'credit' => 0,
-                    'description' => 'Cobro de venta',
-                ]);
-                $totalDebit += $total;
-
-                // 2. Crédito: Ventas (neto de descuento)
-                JournalEntryLine::create([
-                    'journal_entry_id' => $entry->id,
-                    'account_id' => $salesAccount->id,
-                    'debit' => 0,
-                    'credit' => $salesCredit,
-                    'description' => 'Ingreso por ventas',
-                ]);
-                $totalCredit += $salesCredit;
-
-                // 3. Crédito: ITBIS por Pagar
-                if ($tax > 0 && $taxAccount) {
-                    JournalEntryLine::create([
-                        'journal_entry_id' => $entry->id,
-                        'account_id' => $taxAccount->id,
-                        'debit' => 0,
-                        'credit' => $tax,
-                        'description' => 'ITBIS cobrado',
-                    ]);
-                    $totalCredit += $tax;
-                }
-
-                // 4. Costo de Ventas + Inventario
-                $totalCost = 0.0;
-                foreach ($sale->items as $item) {
-                    $unitCost = (float) ($item->unit_cost ?? 0);
-                    if ($unitCost <= 0) {
-                        $unitCost = (float) ($item->product?->cost ?? 0);
+                    $outbox = app(AccountingOutboxService::class)->register($sale);
+                    $outbox = AccountingOutbox::withoutBusinessScope()
+                        ->where('business_id', $sale->business_id)
+                        ->whereKey($outbox->id)->lockForUpdate()->firstOrFail();
+                    if (in_array($outbox->status, ['processed', 'skipped'], true)) {
+                        return;
                     }
-                    $totalCost += $unitCost * (float) $item->quantity;
-                }
-                $totalCost = round($totalCost, 2);
+                    if ($outbox->status === 'failed') {
+                        throw new \RuntimeException('Evento contable agotado; requiere recuperación explícita.');
+                    }
 
-                if ($totalCost > 0 && $cogsAccount && $inventoryAccount) {
+                    if (! self::saleIsCompleted($sale)) {
+                        $outbox->forceFill(['status' => 'skipped', 'lease_token' => null])->save();
+
+                        return;
+                    }
+                    if ($sale->isCreditSale() && (int) $sale->credit_version === 1) {
+                        app(SaleCreditService::class)->assertReceivable($sale);
+                    }
+
+                    $saleNumber = $sale->sale_number ?: $sale->number ?: $sale->id;
+                    $reference = 'Venta #'.$saleNumber;
+
+                    $existing = JournalEntry::withoutBusinessScope()->withTrashed()
+                        ->where('business_id', $sale->business_id)
+                        ->where('reference', $reference)
+                        ->limit(2)->get();
+                    if ($existing->isNotEmpty()) {
+                        $entry = JournalEntry::withoutBusinessScope()->withTrashed()
+                            ->where('business_id', $sale->business_id)
+                            ->whereKey($existing->first()->id)->lockForUpdate()->first();
+                        if (! $entry || $entry->reference !== $reference
+                            || $existing->count() !== 1 || $entry->trashed()
+                            || ! $entry->isPosted() || ! $entry->isBalanced()
+                            || $entry->lines()->count() === 0
+                            || round((float) $entry->lines()->sum('debit'), 2) !== (float) $entry->total_debit
+                            || round((float) $entry->lines()->sum('credit'), 2) !== (float) $entry->total_credit) {
+                            throw new \RuntimeException('Referencia contable heredada ambigua o inválida; requiere revisión.');
+                        }
+                        self::finishSaleEvent($outbox, $entry);
+
+                        return;
+                    }
+
+                    $sale->loadMissing(['items.product']);
+                    if ($sale->items->isEmpty()) {
+                        throw new \RuntimeException('La venta completada no tiene líneas contables recuperables.');
+                    }
+
+                    $accounts = Account::withoutBusinessScope()
+                        ->where('business_id', $sale->business_id)
+                        ->where('is_system', true)
+                        ->get()
+                        ->keyBy('code');
+
+                    if ($accounts->isEmpty()) {
+                        throw new \RuntimeException('No existen cuentas contables para generar el asiento de venta.');
+                    }
+
+                    $paymentAccountCode = self::paymentAccountCode($sale->payment_method);
+                    $paymentAccount = $accounts[$paymentAccountCode] ?? null;
+                    $salesAccount = $accounts['4101'] ?? null;
+                    $taxAccount = $accounts['2201'] ?? null;
+                    $cogsAccount = $accounts['5101'] ?? null;
+                    $inventoryAccount = $accounts['1301'] ?? null;
+
+                    if (! $paymentAccount || ! $salesAccount || ((float) $sale->tax > 0 && ! $taxAccount)) {
+                        throw new \RuntimeException('Faltan cuentas obligatorias de cobro, ventas o ITBIS para generar el asiento.');
+                    }
+
+                    $entry = new JournalEntry([
+                        'date' => $sale->sale_date?->toDateString()
+                            ?? $sale->sold_at?->toDateString()
+                            ?? now()->toDateString(),
+                        'reference' => $reference,
+                        'description' => 'Asiento automático por venta '.$saleNumber,
+                        'status' => JournalEntry::STATUS_POSTED,
+                        'created_by' => $sale->created_by ?? $sale->user_id,
+                        'total_debit' => 0,
+                        'total_credit' => 0,
+                    ]);
+                    $entry->business_id = $sale->business_id;
+                    $entry->save();
+
+                    $totalDebit = 0.0;
+                    $totalCredit = 0.0;
+
+                    $total = round((float) $sale->total, 2);
+                    $tax = round((float) $sale->tax, 2);
+                    // Ventas netas = total - ITBIS (equivale a subtotal - descuento)
+                    $salesCredit = round($total - $tax, 2);
+
+                    // 1. Débito: Caja / Banco / CxC
                     JournalEntryLine::create([
                         'journal_entry_id' => $entry->id,
-                        'account_id' => $cogsAccount->id,
-                        'debit' => $totalCost,
+                        'account_id' => $paymentAccount->id,
+                        'debit' => $total,
                         'credit' => 0,
-                        'description' => 'Costo de productos vendidos',
+                        'description' => 'Cobro de venta',
                     ]);
-                    $totalDebit += $totalCost;
+                    $totalDebit += $total;
 
+                    // 2. Crédito: Ventas (neto de descuento)
                     JournalEntryLine::create([
                         'journal_entry_id' => $entry->id,
-                        'account_id' => $inventoryAccount->id,
+                        'account_id' => $salesAccount->id,
                         'debit' => 0,
-                        'credit' => $totalCost,
-                        'description' => 'Salida de inventario',
+                        'credit' => $salesCredit,
+                        'description' => 'Ingreso por ventas',
                     ]);
-                    $totalCredit += $totalCost;
-                }
+                    $totalCredit += $salesCredit;
 
-                $entry->forceFill([
-                    'total_debit' => round($totalDebit, 2),
-                    'total_credit' => round($totalCredit, 2),
-                ])->saveQuietly();
+                    // 3. Crédito: ITBIS por Pagar
+                    if ($tax > 0 && $taxAccount) {
+                        JournalEntryLine::create([
+                            'journal_entry_id' => $entry->id,
+                            'account_id' => $taxAccount->id,
+                            'debit' => 0,
+                            'credit' => $tax,
+                            'description' => 'ITBIS cobrado',
+                        ]);
+                        $totalCredit += $tax;
+                    }
+
+                    // 4. Costo de Ventas + Inventario
+                    $totalCost = 0.0;
+                    foreach ($sale->items as $item) {
+                        $unitCost = (float) ($item->unit_cost ?? 0);
+                        if ($unitCost <= 0) {
+                            $unitCost = (float) ($item->product?->cost ?? 0);
+                        }
+                        $totalCost += $unitCost * (float) $item->quantity;
+                    }
+                    $totalCost = round($totalCost, 2);
+
+                    if ($totalCost > 0 && (! $cogsAccount || ! $inventoryAccount)) {
+                        throw new \RuntimeException('Faltan las cuentas de costo o inventario para generar el asiento.');
+                    }
+
+                    if ($totalCost > 0) {
+                        JournalEntryLine::create([
+                            'journal_entry_id' => $entry->id,
+                            'account_id' => $cogsAccount->id,
+                            'debit' => $totalCost,
+                            'credit' => 0,
+                            'description' => 'Costo de productos vendidos',
+                        ]);
+                        $totalDebit += $totalCost;
+
+                        JournalEntryLine::create([
+                            'journal_entry_id' => $entry->id,
+                            'account_id' => $inventoryAccount->id,
+                            'debit' => 0,
+                            'credit' => $totalCost,
+                            'description' => 'Salida de inventario',
+                        ]);
+                        $totalCredit += $totalCost;
+                    }
+
+                    $entry->forceFill([
+                        'total_debit' => round($totalDebit, 2),
+                        'total_credit' => round($totalCredit, 2),
+                    ])->saveQuietly();
+
+                    if (round($totalDebit, 2) !== round($totalCredit, 2)) {
+                        throw new \RuntimeException('El asiento automático de la venta quedó desbalanceado.');
+                    }
+                    self::finishSaleEvent($outbox, $entry);
+                });
             });
         } catch (\Throwable $e) {
             Log::error('AccountingService::createFromSale falló', [
                 'sale_id' => $sale->id,
                 'error' => $e->getMessage(),
             ]);
+            throw $e;
         }
+    }
+
+    protected static function finishSaleEvent(AccountingOutbox $event, JournalEntry $entry): void
+    {
+        $event->forceFill([
+            'status' => 'processed',
+            'journal_entry_id' => $entry->id,
+            'processed_at' => now(),
+            'lease_token' => null,
+            'processing_attempts' => $event->processing_attempts + 1,
+        ])->save();
     }
 
     /**
@@ -232,82 +284,85 @@ class AccountingService
     public static function createFromExpense(Expense $expense): void
     {
         try {
-            $reference = 'Gasto #'.$expense->id;
+            TenantContext::run((string) $expense->business_id, function () use ($expense): void {
+                DB::transaction(function () use ($expense): void {
+                    $expense = Expense::withoutBusinessScope()
+                        ->where('business_id', $expense->business_id)
+                        ->whereKey($expense->getKey())
+                        ->lockForUpdate()
+                        ->firstOrFail();
 
-            $exists = JournalEntry::withoutBusinessScope()
-                ->where('business_id', $expense->business_id)
-                ->where('reference', $reference)
-                ->exists();
+                    $reference = 'Gasto #'.$expense->getKey();
 
-            if ($exists) {
-                return;
-            }
+                    if (JournalEntry::withoutBusinessScope()
+                        ->where('business_id', $expense->business_id)
+                        ->where('reference', $reference)
+                        ->exists()
+                    ) {
+                        return;
+                    }
 
-            $amount = round((float) $expense->amount, 2);
-            if ($amount <= 0) {
-                return;
-            }
+                    $amount = round((float) $expense->amount, 2);
+                    if ($amount <= 0) {
+                        return;
+                    }
 
-            DB::transaction(function () use ($expense, $reference, $amount): void {
-                $accounts = Account::withoutBusinessScope()
-                    ->where('business_id', $expense->business_id)
-                    ->where('is_system', true)
-                    ->get()
-                    ->keyBy('code');
+                    $accounts = Account::withoutBusinessScope()
+                        ->where('business_id', $expense->business_id)
+                        ->where('is_system', true)
+                        ->get()
+                        ->keyBy('code');
 
-                $expenseAccount = $accounts['6101'] ?? null; // Gastos Operativos
-                $paymentCode = self::expensePaymentAccountCode($expense->payment_method);
-                $cashAccount = $accounts[$paymentCode] ?? $accounts['1101'] ?? null;
+                    $expenseAccount = $accounts['6101'] ?? null; // Gastos Operativos
+                    $paymentCode = self::expensePaymentAccountCode($expense->payment_method);
+                    $cashAccount = $accounts[$paymentCode] ?? $accounts['1101'] ?? null;
 
-                if (! $expenseAccount || ! $cashAccount) {
-                    Log::warning('AccountingService: faltan cuentas para gasto', [
-                        'expense_id' => $expense->id,
-                        'business_id' => $expense->business_id,
+                    if (! $expenseAccount || ! $cashAccount) {
+                        throw new \RuntimeException('Faltan las cuentas de gasto o de pago para generar el asiento.');
+                    }
+
+                    $entry = new JournalEntry([
+                        'date' => $expense->expense_date?->toDateString()
+                            ?? $expense->created_at?->toDateString()
+                            ?? now()->toDateString(),
+                        'reference' => $reference,
+                        'description' => 'Asiento automático por gasto: '.($expense->description ?? 'Sin descripción'),
+                        'status' => JournalEntry::STATUS_POSTED,
+                        'created_by' => $expense->created_by ?? $expense->user_id ?? auth()->id(),
+                        'total_debit' => $amount,
+                        'total_credit' => $amount,
+                    ]);
+                    $entry->business_id = $expense->business_id;
+                    $entry->save();
+
+                    JournalEntryLine::create([
+                        'journal_entry_id' => $entry->id,
+                        'account_id' => $expenseAccount->id,
+                        'debit' => $amount,
+                        'credit' => 0,
+                        'description' => $expense->description ?? 'Gasto',
                     ]);
 
-                    return;
-                }
+                    JournalEntryLine::create([
+                        'journal_entry_id' => $entry->id,
+                        'account_id' => $cashAccount->id,
+                        'debit' => 0,
+                        'credit' => $amount,
+                        'description' => 'Pago de gasto',
+                    ]);
 
-                $entry = new JournalEntry([
-                    'date' => $expense->expense_date?->toDateString()
-                        ?? $expense->created_at?->toDateString()
-                        ?? now()->toDateString(),
-                    'reference' => $reference,
-                    'description' => 'Asiento automático por gasto: '.($expense->description ?? 'Sin descripción'),
-                    'status' => JournalEntry::STATUS_POSTED,
-                    'created_by' => $expense->created_by ?? $expense->user_id ?? auth()->id(),
-                    'total_debit' => $amount,
-                    'total_credit' => $amount,
-                ]);
-                $entry->business_id = $expense->business_id;
-                $entry->save();
-
-                JournalEntryLine::create([
-                    'journal_entry_id' => $entry->id,
-                    'account_id' => $expenseAccount->id,
-                    'debit' => $amount,
-                    'credit' => 0,
-                    'description' => $expense->description ?? 'Gasto',
-                ]);
-
-                JournalEntryLine::create([
-                    'journal_entry_id' => $entry->id,
-                    'account_id' => $cashAccount->id,
-                    'debit' => 0,
-                    'credit' => $amount,
-                    'description' => 'Pago de gasto',
-                ]);
-
-                $entry->forceFill([
-                    'total_debit' => $amount,
-                    'total_credit' => $amount,
-                ])->saveQuietly();
+                    $entry->forceFill([
+                        'total_debit' => $amount,
+                        'total_credit' => $amount,
+                    ])->saveQuietly();
+                });
             });
         } catch (\Throwable $e) {
             Log::error('AccountingService::createFromExpense falló', [
                 'expense_id' => $expense->id,
                 'error' => $e->getMessage(),
             ]);
+            throw $e;
         }
     }
 

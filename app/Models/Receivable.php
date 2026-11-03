@@ -2,7 +2,10 @@
 
 namespace App\Models;
 
+use App\Database\ReceivableQueryBuilder;
 use App\Services\CashSessionService;
+use App\Services\SaleCreditService;
+use App\Services\SaleReceivableIntegrity;
 use App\Traits\BelongsToBusiness;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Concerns\HasUuids;
@@ -15,7 +18,9 @@ class Receivable extends Model
 {
     use BelongsToBusiness;
     use HasUuids;
-    use SoftDeletes;
+    use SoftDeletes {
+        forceDestroy as private forceDestroyUnprotected;
+    }
 
     protected $fillable = [
         // business_id: trait
@@ -35,11 +40,53 @@ class Receivable extends Model
     protected function casts(): array
     {
         return [
+            'original_amount' => 'decimal:2',
             'amount' => 'decimal:2',
             'paid_amount' => 'decimal:2',
             'balance' => 'decimal:2',
             'due_date' => 'date',
         ];
+    }
+
+    public function save(array $options = [])
+    {
+        return app(SaleReceivableIntegrity::class)->modelWrite(
+            $this, 'update', fn () => parent::save($options),
+        );
+    }
+
+    public static function destroy($ids)
+    {
+        $arguments = func_get_args();
+
+        return (new static)->getConnection()->transaction(fn () => parent::destroy(...$arguments));
+    }
+
+    public static function forceDestroy($ids)
+    {
+        $arguments = func_get_args();
+
+        return (new static)->getConnection()->transaction(fn () => static::forceDestroyUnprotected(...$arguments));
+    }
+
+    public function delete()
+    {
+        if (! $this->exists) {
+            return parent::delete();
+        }
+
+        return app(SaleReceivableIntegrity::class)->modelWrite(
+            $this, 'delete', fn () => parent::delete(),
+        );
+    }
+
+    protected function newBaseQueryBuilder()
+    {
+        $connection = $this->getConnection();
+
+        return new ReceivableQueryBuilder(
+            $connection, $connection->getQueryGrammar(), $connection->getPostProcessor(),
+        );
     }
 
     public function customer(): BelongsTo
@@ -82,6 +129,11 @@ class Receivable extends Model
      */
     public function refreshPaymentStatus(): void
     {
+        if ($this->sale_id !== null) {
+            app(SaleCreditService::class)->refreshPayments($this);
+
+            return;
+        }
         $paid = round((float) $this->payments()->sum('amount'), 2);
         $amount = round((float) $this->amount, 2);
         $balance = round(max(0, $amount - $paid), 2);
@@ -171,6 +223,9 @@ class Receivable extends Model
         });
 
         static::saving(function (Receivable $receivable): void {
+            if ($receivable->sale_id !== null) {
+                return;
+            }
             $amount = (float) $receivable->amount;
             $paid = (float) $receivable->paid_amount;
             $receivable->balance = round(max(0, $amount - $paid), 2);

@@ -2,8 +2,11 @@
 
 namespace App\Scopes;
 
+use App\Models\StockCount;
+use App\Models\StockCountItem;
 use App\Services\AuthContextResolver;
 use App\Services\BranchAccessContext;
+use Illuminate\Auth\Access\AuthorizationException;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Scope;
@@ -22,11 +25,8 @@ use Illuminate\Support\Facades\Session;
  *   4. El usuario NO es owner/admin/supervisor/manager en ese negocio.
  *   5. El usuario tiene una sucursal asignada (pivot user_business.branch_id).
  *
- * Cuando aplica, restringe:
- *   WHERE branch_id = <user_branch> OR branch_id IS NULL
- *
- * NULL = fondo común (histórico pre-S1). Se mantiene visible para no ocultar
- * datos legítimos que aún no fueron migrados a una sucursal.
+ * Cuando aplica, restringe por sucursal. Los conteos de inventario no admiten
+ * branch_id NULL porque contienen snapshots de cantidades y costos.
  *
  * FASE H1: la resolución (business, features, pivot) se lee de
  * BranchAccessContext (cache request-scoped) para evitar N+1 sobre
@@ -45,10 +45,12 @@ final class BranchScope implements Scope
         }
 
         $table = $model->getTable();
+        $allowUnassignedBranch = ! ($model instanceof StockCount)
+            && ! ($model instanceof StockCountItem);
 
-        $builder->where(function (Builder $q) use ($branchId, $table): void {
+        $builder->where(function (Builder $q) use ($branchId, $table, $allowUnassignedBranch): void {
             $q->where("{$table}.branch_id", $branchId)
-                ->orWhereNull("{$table}.branch_id");
+                ->when($allowUnassignedBranch, fn (Builder $q) => $q->orWhereNull("{$table}.branch_id"));
         });
     }
 
@@ -61,27 +63,32 @@ final class BranchScope implements Scope
             return null;
         }
 
-        $sessionBusinessId = Session::get(AuthContextResolver::SESSION_BUSINESS_ID);
+        /** @var \App\Models\User $user */
+        $user = Auth::user();
+        $sessionBusinessId = Session::get(AuthContextResolver::SESSION_BUSINESS_ID)
+            ?: (app()->bound('currentBusinessId') ? app('currentBusinessId') : null)
+            ?: $user->current_business_id;
+
         if (! $sessionBusinessId) {
-            return null;
+            if ($user->is_master_admin) {
+                return null;
+            }
+
+            throw new AuthorizationException('No se pudo verificar el contexto de sucursal.');
         }
 
         // El modelo debe pertenecer al mismo negocio que la sesión.
         $modelBusinessId = $model->getAttribute('business_id');
         if ($modelBusinessId !== null && (string) $modelBusinessId !== (string) $sessionBusinessId) {
-            return null;
+            throw new AuthorizationException('El registro no pertenece al negocio activo.');
         }
-
-        /** @var \App\Models\User $user */
-        $user = Auth::user();
 
         $snapshot = app(BranchAccessContext::class)->resolveFor($user, (string) $sessionBusinessId);
 
-        if ($snapshot === null || ! $snapshot->shouldRestrictReads()) {
+        if (! $snapshot->shouldRestrictReads()) {
             return null;
         }
 
         return $snapshot->effectiveBranchId();
     }
 }
-

@@ -69,8 +69,9 @@ class ReceivableResource extends Resource
                 Forms\Components\Section::make('Información de la Deuda')
                     ->schema([
                         Forms\Components\Select::make('customer_id')
+                            ->disabled(fn (?Receivable $record): bool => $record?->sale_id !== null)
                             ->label('Cliente registrado')
-                            ->options(fn () => \App\Models\Customer::query()
+                            ->options(fn () => Customer::query()
                                 ->where('is_active', true)
                                 ->orderBy('name')
                                 ->limit(200)
@@ -91,12 +92,14 @@ class ReceivableResource extends Resource
                             }),
 
                         Forms\Components\TextInput::make('customer_name')
+                            ->disabled(fn (?Receivable $record): bool => $record?->sale_id !== null)
                             ->label('Nombre del Cliente')
                             ->required()
                             ->maxLength(255)
                             ->helperText('Obligatorio. Se completa al elegir cliente o puedes escribirlo (fiado).'),
 
                         Forms\Components\TextInput::make('reference')
+                            ->disabled(fn (?Receivable $record): bool => $record?->sale_id !== null)
                             ->label('Referencia / Factura')
                             ->placeholder('Ej: FAC-2026-0891')
                             ->maxLength(100),
@@ -108,6 +111,7 @@ class ReceivableResource extends Resource
                             ->columnSpanFull(),
 
                         Forms\Components\TextInput::make('amount')
+                            ->disabled(fn (?Receivable $record): bool => $record?->sale_id !== null)
                             ->label('Monto Total')
                             ->required()
                             ->numeric()
@@ -136,7 +140,7 @@ class ReceivableResource extends Resource
                             ])
                             ->default('pendiente')
                             ->disabled()
-                            ->dehydrated()
+                            ->dehydrated(fn (?Receivable $record): bool => $record?->sale_id === null)
                             ->helperText('Se actualiza automáticamente con los cobros y el vencimiento.'),
                     ])
                     ->columns(2),
@@ -149,7 +153,7 @@ class ReceivableResource extends Resource
                             ->prefix('RD$')
                             ->default(0)
                             ->disabled()
-                            ->dehydrated()
+                            ->dehydrated(fn (?Receivable $record): bool => $record?->sale_id === null)
                             ->helperText('Se calcula con el historial de cobros (botón Registrar Cobro).'),
 
                         Forms\Components\TextInput::make('balance')
@@ -157,7 +161,7 @@ class ReceivableResource extends Resource
                             ->numeric()
                             ->prefix('RD$')
                             ->disabled()
-                            ->dehydrated()
+                            ->dehydrated(fn (?Receivable $record): bool => $record?->sale_id === null)
                             ->default(0),
 
                         Forms\Components\Textarea::make('notes')
@@ -433,6 +437,9 @@ class ReceivableResource extends Resource
 
     public static function canDelete($record): bool
     {
+        if ($record->sale_id !== null) {
+            return false;
+        }
         if (! static::tenantHasModule()) {
             return false;
         }

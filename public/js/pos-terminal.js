@@ -45,6 +45,27 @@
             toastTimer: null,
             vehicle: [],
         };
+        var checkoutStorage = 'pos-checkout:' + cfg.business.id + ':' + cfg.cashier_id;
+        var pendingCheckout = null;
+        var checkoutStorageAvailable = true;
+        try {
+            pendingCheckout = JSON.parse(sessionStorage.getItem(checkoutStorage) || 'null');
+            if (pendingCheckout && (!pendingCheckout.body || !pendingCheckout.body.idempotency_key
+                || !Array.isArray(pendingCheckout.body.items))) {
+                throw new Error('Solicitud pendiente ilegible');
+            }
+            if (pendingCheckout && pendingCheckout.body && Array.isArray(pendingCheckout.body.items)) {
+                pendingCheckout.body.items.forEach(function (item) {
+                    state.cart[item.key || item.product_id] = Object.assign({}, item);
+                });
+                state.payment = pendingCheckout.body.payment_method;
+                state.customerId = pendingCheckout.body.customer_id || '';
+                state.tendered = pendingCheckout.body.amount_tendered || '';
+                state.quoteId = pendingCheckout.body.quote_id || '';
+            }
+        } catch (e) {
+            checkoutStorageAvailable = false;
+        }
 
         function cartList() {
             return Object.keys(state.cart).map(function (k) { return state.cart[k]; });
@@ -407,6 +428,15 @@
 
         function checkout() {
             if (state.busy) return;
+            if (!checkoutStorageAvailable) {
+                toast('No se puede conservar la solicitud', 'Habilita el almacenamiento de la pestaña antes de cobrar.', 'err');
+                return;
+            }
+            if (pendingCheckout && pendingCheckout.editable !== true) {
+                toast('Reintentando la solicitud original', 'No se enviará una venta nueva ni los cambios posteriores del carrito.', 'ok');
+                sendCheckout(pendingCheckout.body);
+                return;
+            }
             var items = cartList();
             if (!items.length) {
                 toast('Agrega productos primero', '', 'err');
@@ -432,25 +462,48 @@
                 toast('Cliente requerido', '', 'err');
                 return;
             }
+            var bytes = new Uint8Array(16);
+            window.crypto.getRandomValues(bytes);
+            var body = {
+                idempotency_key: pendingCheckout ? pendingCheckout.body.idempotency_key
+                    : Array.from(bytes, function (n) { return n.toString(16).padStart(2, '0'); }).join(''),
+                items: items,
+                payment_method: state.payment,
+                customer_id: state.customerId || null,
+                amount_tendered: state.payment === 'efectivo' ? parseFloat(state.tendered) : null,
+                tax_rate: cfg.tax_rate,
+                quote_id: state.quoteId || null,
+            };
+            pendingCheckout = JSON.parse(JSON.stringify({ body: body }));
+            try {
+                sessionStorage.setItem(checkoutStorage, JSON.stringify(pendingCheckout));
+            } catch (e) {
+                checkoutStorageAvailable = false;
+                toast('Solicitud no enviada', 'No se pudo conservar su identidad; no se cobró.', 'err');
+                return;
+            }
+            sendCheckout(pendingCheckout.body);
+        }
+
+        function sendCheckout(body) {
             state.busy = true;
             render();
             api(cfg.api.checkout, {
                 method: 'POST',
-                json: {
-                    items: items,
-                    payment_method: state.payment,
-                    customer_id: state.customerId || null,
-                    amount_tendered: state.payment === 'efectivo' ? parseFloat(state.tendered) : null,
-                    tax_rate: cfg.tax_rate,
-                    quote_id: state.quoteId || null,
-                },
+                json: body,
             }).then(function (data) {
                 state.busy = false;
                 if (!data.ok) {
+                    if (data.retry_safe === true) {
+                        pendingCheckout.editable = true;
+                        sessionStorage.setItem(checkoutStorage, JSON.stringify(pendingCheckout));
+                    }
                     toast(data.title || 'No se pudo completar la venta', data.message || '', 'err');
                     render();
                     return;
                 }
+                sessionStorage.removeItem(checkoutStorage);
+                pendingCheckout = null;
                 var ch = Number(data.change || 0);
                 toast(
                     ch > 0 ? ('Vuelto: ' + money(ch)) : 'Venta cobrada',
@@ -480,7 +533,7 @@
                 focusBarcode(true);
             }).catch(function () {
                 state.busy = false;
-                toast('Error de red', 'No se pudo cobrar.', 'err');
+                toast('Resultado sin confirmar', 'Reintenta la misma solicitud; no inicies otro cobro para esta venta.', 'err');
                 render();
             });
         }

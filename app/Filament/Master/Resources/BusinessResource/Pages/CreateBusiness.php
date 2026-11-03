@@ -6,7 +6,6 @@ use App\Filament\Master\Resources\BusinessResource;
 use App\Models\Business;
 use App\Models\MasterAuditLog;
 use App\Models\User;
-use App\Services\AccountingService;
 use Filament\Notifications\Notification;
 use Filament\Resources\Pages\CreateRecord;
 use Illuminate\Support\Facades\DB;
@@ -95,12 +94,6 @@ class CreateBusiness extends CreateRecord
                     'owner_id' => $owner->getKey(),
                 ])->save();
 
-                // 5. Plan de cuentas por defecto
-                try {
-                    AccountingService::createDefaultAccounts($business);
-                } catch (Throwable) {
-                    // No bloquear la creación del negocio
-                }
             });
         } catch (Throwable $e) {
             Notification::make()

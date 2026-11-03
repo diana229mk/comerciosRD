@@ -10,8 +10,10 @@ use App\Models\ProductBatch;
 use App\Models\ProductVariant;
 use App\Models\SaleItem;
 use App\Models\SaleItemBatch;
+use App\Models\User;
 use App\Scopes\BranchScope;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Auth\Access\AuthorizationException;
 use Illuminate\Support\Facades\DB;
 use InvalidArgumentException;
 use RuntimeException;
@@ -532,33 +534,43 @@ class InventoryService
      * S3a+ · Decide si limitar la deducción FEFO a lotes de la sucursal
      * actual (más lotes "sin sucursal", fondo común).
      *
-     * Devuelve el UUID de la sucursal actual si:
-     *  - El negocio tiene feature "strict_branch_stock" activada.
-     *  - Hay una sesión con branch_id vigente Y coincide con el negocio del
-     *    producto (evita fugas cross-tenant).
-     *
-     * Fallback seguro (jobs, CLI, API sin sesión): devuelve null → no filtra.
+     * Devuelve la sucursal autorizada si el flag está activo. En flujos
+     * autenticados, cualquier contexto ausente o inválido falla cerrado.
+     * Las ventas de jobs/CLI deben establecer una identidad de usuario y
+     * sucursal autorizada antes de descontar lotes.
      */
     protected static function shouldRestrictToBranch(Product $product): ?string
     {
-        try {
-            $business = Business::query()->find($product->business_id);
-            if (! $business || ! $business->hasFeature('strict_branch_stock')) {
-                return null;
-            }
-
-            $sessionBusinessId = session(\App\Services\AuthContextResolver::SESSION_BUSINESS_ID);
-            if ($sessionBusinessId === null
-                || (string) $sessionBusinessId !== (string) $product->business_id
-            ) {
-                return null;
-            }
-
-            $branchId = session(\App\Services\AuthContextResolver::SESSION_BRANCH_ID);
-
-            return ($branchId !== null && $branchId !== '') ? (string) $branchId : null;
-        } catch (\Throwable) {
+        $business = Business::query()->find($product->business_id);
+        if (! $business || ! $business->hasFeature('strict_branch_stock')) {
             return null;
         }
+
+        $user = auth()->user();
+        if (! $user instanceof User) {
+            throw new RuntimeException(
+                'La venta requiere una sucursal explícita cuando strict_branch_stock está activo.'
+            );
+        }
+
+        $sessionBusinessId = session(\App\Services\AuthContextResolver::SESSION_BUSINESS_ID)
+            ?: (app()->bound('currentBusinessId') ? app('currentBusinessId') : null)
+            ?: $user->current_business_id;
+
+        if ((string) $sessionBusinessId !== (string) $product->business_id) {
+            throw new AuthorizationException('No se pudo verificar el negocio de la venta.');
+        }
+
+        $snapshot = app(BranchAccessContext::class)
+            ->resolveFor($user, (string) $product->business_id);
+        $branchId = $snapshot->effectiveBranchId();
+
+        if (! $snapshot->shouldRestrictReads() || $branchId === null) {
+            throw new AuthorizationException(
+                'Selecciona una sucursal antes de vender con strict_branch_stock activo.'
+            );
+        }
+
+        return $branchId;
     }
 }

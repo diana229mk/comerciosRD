@@ -8,6 +8,7 @@ This document is a step-by-step checklist to deploy ComerciosRD to production sa
 Before you start
 ----------------
 - Do not store secrets in the repository. Use a secure vault or environment variables in your hosting platform.
+- INF-06 MySQL TLS passed **72 tests/281 assertions plus four Oracle checks in isolated Docker**, not in production. Production TCP requires a readable CA and verified server identity across Laravel, identity checks and portability clients. Follow [mysql-tls.md](mysql-tls.md); mount the provider CA read-only in every runtime before any separately authorized deployment. Never deploy the disposable test certificates.
 - Prepare a production `.env` using `.env.production.example` (replace placeholders with real values).
 - Ensure you have an automatic DB backup and at least one tested restore snapshot.
 - Have access to the application server, supervisor/systemd (for queues), and the logs.
@@ -160,7 +161,30 @@ jobs:
   - php artisan view:cache
 - Queue management:
   - php artisan queue:restart
-  - php artisan queue:work --tries=3 --timeout=120 (for supervisor config)
+  - php artisan queue:work redis --queue=sales,reports,default --sleep=3 --tries=3 --timeout=90 --max-time=3600 --memory=256 (for supervisor config)
+  - Match the queue list to `SCALE_QUEUE_SALES`, `SCALE_QUEUE_REPORTS` and
+    `REDIS_QUEUE` on every producer and worker. Keep `REDIS_QUEUE_RETRY_AFTER=180`
+    greater than the worker timeout (90s), and allow at least 120s for shutdown
+    (`stopwaitsecs` / `stop_grace_period`). Supervise automatic restarts,
+    including normal exits from `--max-time`.
+  - Before enabling `SCALE_POST_SALE_QUEUE`, verify a completed sale is consumed
+    and produces exactly one balanced entry. A running process is not proof of
+    queue progress; monitor pending age, `queue:failed` and worker errors.
+  - After fixing the cause of a failure, retry only the reviewed job UUID with
+    `php artisan queue:retry <uuid>`. Do not blindly retry all failed jobs.
+    Sale accounting locks the sale and checks its business/reference inside
+    the posting transaction; a retry must not repeat inventory or cash effects.
+  - `sales:reconcile-side-effects --hours=24` is scheduled hourly, but only
+    examines up to 500 recent sales per invocation. It is not a transactional
+    outbox or a guarantee against Redis loss; reconcile prolonged outages
+    explicitly before accepting production.
+  - INF-04 adds a durable SQL accounting outbox and a per-business/year sequence.
+    See [accounting-outbox.md](accounting-outbox.md): isolated validation passed
+    53 tests/768 assertions after fixing explicit queue routing. This is not
+    production approval. Do not deploy it or apply migrations
+    to real databases based on this guide. Monitor SQL events, not only Redis.
+    An exhausted outbox event requires an explicit reviewed tenant/event retry;
+    `queue:retry` alone does not reopen its durable retry budget.
 - Troubleshooting logs:
   - tail -f storage/logs/laravel.log
   - php artisan tinker (debug small checks)

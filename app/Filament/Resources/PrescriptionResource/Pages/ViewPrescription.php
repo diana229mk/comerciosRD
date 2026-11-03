@@ -4,17 +4,34 @@ namespace App\Filament\Resources\PrescriptionResource\Pages;
 
 use App\Filament\Resources\PrescriptionResource;
 use App\Models\Prescription;
+use App\Services\SaleService;
 use Filament\Actions;
+use Filament\Forms\Components\Group;
+use Filament\Forms\Components\Placeholder;
+use Filament\Forms\Components\Select;
+use Filament\Forms\Components\TextInput;
 use Filament\Infolists\Components\Grid;
 use Filament\Infolists\Components\RepeatableEntry;
 use Filament\Infolists\Components\Section;
 use Filament\Infolists\Components\TextEntry;
 use Filament\Infolists\Infolist;
+use Filament\Notifications\Notification;
 use Filament\Resources\Pages\ViewRecord;
+use Illuminate\Support\Str;
+use Livewire\Attributes\Locked;
 
 class ViewPrescription extends ViewRecord
 {
     protected static string $resource = PrescriptionResource::class;
+
+    #[Locked]
+    public string $dispenseCheckoutKey = '';
+
+    public function mount(int|string $record): void
+    {
+        parent::mount($record);
+        $this->dispenseCheckoutKey = (string) Str::uuid();
+    }
 
     protected function getHeaderActions(): array
     {
@@ -38,18 +55,18 @@ class ViewPrescription extends ViewRecord
                         if ($remaining <= 0) {
                             continue;
                         }
-                        $rows[] = \Filament\Forms\Components\Group::make([
-                            \Filament\Forms\Components\Placeholder::make('info_'.$it->id)
+                        $rows[] = Group::make([
+                            Placeholder::make('info_'.$it->id)
                                 ->label($it->product_name)
                                 ->content("Recetado: {$it->quantity_prescribed} · Ya dispensado: {$it->quantity_dispensed} · Restante: {$remaining}"),
-                            \Filament\Forms\Components\TextInput::make('qty_'.$it->id)
+                            TextInput::make('qty_'.$it->id)
                                 ->label('Cantidad a dispensar ahora')
                                 ->numeric()
                                 ->minValue(0)
                                 ->maxValue($remaining)
                                 ->step(0.001)
                                 ->default(0),
-                            \Filament\Forms\Components\TextInput::make('price_'.$it->id)
+                            TextInput::make('price_'.$it->id)
                                 ->label('Precio unitario (RD$)')
                                 ->numeric()
                                 ->minValue(0)
@@ -60,19 +77,20 @@ class ViewPrescription extends ViewRecord
                     }
 
                     return array_merge($rows, [
-                        \Filament\Forms\Components\Select::make('payment_method')
+                        Select::make('payment_method')
                             ->label('Método de pago')
-                            ->options([
+                            ->options(fn (): array => array_filter([
                                 'efectivo' => 'Efectivo',
                                 'tarjeta' => 'Tarjeta',
                                 'transferencia' => 'Transferencia',
                                 'fiado' => 'Fiado / Crédito',
-                            ])
+                            ], fn ($key): bool => $key !== 'fiado'
+                                || (bool) $this->getRecord()->business?->hasModule('receivables'), ARRAY_FILTER_USE_KEY))
                             ->default('efectivo')
                             ->required()
                             ->native(false),
 
-                        \Filament\Forms\Components\TextInput::make('tax_rate')
+                        TextInput::make('tax_rate')
                             ->label('ITBIS %')
                             ->numeric()
                             ->default(18)
@@ -88,7 +106,7 @@ class ViewPrescription extends ViewRecord
                             continue;
                         }
                         if (! $it->product_id) {
-                            \Filament\Notifications\Notification::make()
+                            Notification::make()
                                 ->title('Producto no catalogado')
                                 ->body("El renglón \"{$it->product_name}\" no tiene producto asociado; asócialo antes de dispensar.")
                                 ->danger()
@@ -105,7 +123,7 @@ class ViewPrescription extends ViewRecord
                     }
 
                     if ($items === []) {
-                        \Filament\Notifications\Notification::make()
+                        Notification::make()
                             ->title('Nada por dispensar')
                             ->body('Ingresa una cantidad mayor a cero en al menos un renglón.')
                             ->warning()
@@ -115,7 +133,8 @@ class ViewPrescription extends ViewRecord
                     }
 
                     try {
-                        $sale = app(\App\Services\SaleService::class)->create([
+                        $sale = app(SaleService::class)->create([
+                            'idempotency_key' => $this->dispenseCheckoutKey,
                             'business_id' => (string) $rx->business_id,
                             'customer_id' => $rx->customer_id,
                             'customer_name' => $rx->patient_name,
@@ -125,7 +144,7 @@ class ViewPrescription extends ViewRecord
                             'notes' => 'Dispensación receta '.$rx->code,
                         ]);
                     } catch (\Throwable $e) {
-                        \Filament\Notifications\Notification::make()
+                        Notification::make()
                             ->title('No se pudo dispensar')
                             ->body($e->getMessage())
                             ->danger()
@@ -134,7 +153,8 @@ class ViewPrescription extends ViewRecord
                         return;
                     }
 
-                    \Filament\Notifications\Notification::make()
+                    $this->dispenseCheckoutKey = (string) Str::uuid();
+                    Notification::make()
                         ->title('Dispensación registrada')
                         ->body('Venta '.$sale->sale_number.' — Total RD$ '.number_format((float) $sale->total, 2))
                         ->success()

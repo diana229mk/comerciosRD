@@ -2,28 +2,36 @@
 
 namespace App\Filament\Resources;
 
+use App\Enums\BusinessType;
+use App\Enums\EcfType;
 use App\Enums\PaymentMethod;
 use App\Enums\SaleStatus;
 use App\Filament\Concerns\ChecksBusinessModule;
-use App\Filament\Resources\SaleResource\Pages;
-use App\Models\Customer;
 // ElectronicInvoiceResource used for e-CF view link
+use App\Filament\Resources\SaleResource\Pages;
+use App\Filament\Support\BranchTableHelpers;
+use App\Models\Customer;
 use App\Models\Product;
 use App\Models\Sale;
+use App\Services\EcfService;
+use App\Services\SaleFinancialIntegrity;
 use App\Services\SaleService;
-use Filament\Facades\Filament;
+use App\Support\EcfFeature;
 use Filament\Forms;
+use Filament\Forms\Components\Component;
 use Filament\Forms\Form;
 use Filament\Forms\Get;
 use Filament\Forms\Set;
 use Filament\Infolists;
 use Filament\Infolists\Infolist;
+use Filament\Notifications\Actions\Action;
 use Filament\Notifications\Notification;
 use Filament\Resources\Resource;
 use Filament\Tables;
 use Filament\Tables\Table;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\SoftDeletingScope;
+use Illuminate\Http\RedirectResponse;
 use Illuminate\Support\HtmlString;
 
 class SaleResource extends Resource
@@ -33,8 +41,11 @@ class SaleResource extends Resource
     protected static string $businessModule = 'sales';
 
     protected static string $viewPermission = 'view_sales';
+
     protected static string $createPermission = 'create_sales';
+
     protected static string $editPermission = 'edit_sales';
+
     protected static ?string $deletePermission = null;
 
     /** Visible en menú del cajero */
@@ -93,11 +104,13 @@ class SaleResource extends Resource
                             ->placeholder('Se genera al guardar (VTA-2026-00001)'),
 
                         Forms\Components\TextInput::make('customer_name')
+                            ->disabled(fn (?Sale $record): bool => self::financialEditLocked($record))
                             ->label('Cliente (nombre)')
                             ->placeholder('Cliente general')
                             ->maxLength(255),
 
                         Forms\Components\Select::make('customer_id')
+                            ->disabled(fn (?Sale $record): bool => self::financialEditLocked($record))
                             ->label(function (): string {
                                 return match (filament()->getTenant()?->business_type) {
                                     'colmado' => 'Cliente (fiado)',
@@ -140,16 +153,22 @@ class SaleResource extends Resource
                             }),
 
                         Forms\Components\Select::make('payment_method')
+                            ->disabled(fn (?Sale $record): bool => self::financialEditLocked($record))
                             ->label('Método de pago')
                             ->options(function (): array {
                                 $type = filament()->getTenant()?->type
-                                    ?? \App\Enums\BusinessType::tryFrom(
+                                    ?? BusinessType::tryFrom(
                                         (string) (filament()->getTenant()?->business_type ?? 'general')
                                     );
 
-                                return PaymentMethod::optionsForBusinessType(
-                                    $type instanceof \App\Enums\BusinessType ? $type : null
+                                $methods = PaymentMethod::optionsForBusinessType(
+                                    $type instanceof BusinessType ? $type : null
                                 );
+                                if (! filament()->getTenant()?->hasModule('receivables')) {
+                                    unset($methods[PaymentMethod::Credito->value]);
+                                }
+
+                                return $methods;
                             })
                             ->default(PaymentMethod::Efectivo->value)
                             ->required()
@@ -163,6 +182,7 @@ class SaleResource extends Resource
                             }),
 
                         Forms\Components\TextInput::make('amount_paid')
+                            ->disabled(fn (?Sale $record): bool => self::financialEditLocked($record))
                             ->label('Monto recibido')
                             ->numeric()
                             ->prefix('RD$')
@@ -184,6 +204,7 @@ class SaleResource extends Resource
                             ->visible(fn (Get $get): bool => ! PaymentMethod::isCreditValue($get('payment_method'))),
 
                         Forms\Components\TextInput::make('discount')
+                            ->disabled(fn (?Sale $record): bool => self::financialEditLocked($record))
                             ->label('Descuento')
                             ->numeric()
                             ->prefix('RD$')
@@ -220,6 +241,7 @@ class SaleResource extends Resource
                 })
                     ->schema([
                         Forms\Components\TextInput::make('barcode_scanner')
+                            ->disabled(fn (?Sale $record): bool => self::financialEditLocked($record))
                             ->label(function (): string {
                                 return match (filament()->getTenant()?->business_type) {
                                     'farmacia' => 'Buscar medicamento / código',
@@ -392,6 +414,7 @@ class SaleResource extends Resource
                     ->collapsed(false),
 
                 Forms\Components\Section::make('Productos')
+                    ->disabled(fn (?Sale $record): bool => self::financialEditLocked($record))
                     ->schema([
                         Forms\Components\Repeater::make('items')
                             ->schema([
@@ -472,6 +495,7 @@ class SaleResource extends Resource
                     ]),
 
                 Forms\Components\Section::make('Totales')
+                    ->disabled(fn (?Sale $record): bool => self::financialEditLocked($record))
                     ->schema([
                         Forms\Components\TextInput::make('subtotal')
                             ->label('Subtotal')
@@ -669,7 +693,7 @@ class SaleResource extends Resource
                     ->label('Cajero')
                     ->toggleable(isToggledHiddenByDefault: true),
 
-                \App\Filament\Support\BranchTableHelpers::column(),
+                BranchTableHelpers::column(),
             ])
             ->defaultSort('created_at', 'desc')
             ->filters([
@@ -678,7 +702,7 @@ class SaleResource extends Resource
                 Tables\Filters\SelectFilter::make('payment_method')
                     ->label('Pago')
                     ->options(PaymentMethod::options()),
-                \App\Filament\Support\BranchTableHelpers::filter(),
+                BranchTableHelpers::filter(),
                 Tables\Filters\TrashedFilter::make(),
             ])
             ->actions([
@@ -705,7 +729,7 @@ class SaleResource extends Resource
                     ->icon('heroicon-o-document-text')
                     ->color('primary')
                     ->visible(function (Sale $record): bool {
-                        if (! \App\Support\EcfFeature::enabled()) {
+                        if (! EcfFeature::enabled()) {
                             return false;
                         }
 
@@ -740,17 +764,17 @@ class SaleResource extends Resource
                     ->modalDescription('Se generará el número fiscal y el comprobante interno. El envío a la DGII se implementará después.')
                     ->action(function (Sale $record, array $data): void {
                         try {
-                            $type = \App\Enums\EcfType::from((string) $data['ecf_type']);
-                            $invoice = \App\Services\EcfService::createFromSale($record, $type);
+                            $type = EcfType::from((string) $data['ecf_type']);
+                            $invoice = EcfService::createFromSale($record, $type);
 
                             Notification::make()
                                 ->title('Comprobante emitido')
                                 ->body('e-CF: '.$invoice->ecf_number)
                                 ->success()
                                 ->actions([
-                                    \Filament\Notifications\Actions\Action::make('ver')
+                                    Action::make('ver')
                                         ->label('Ver comprobante')
-                                        ->url(\App\Filament\Resources\ElectronicInvoiceResource::getUrl('view', ['record' => $invoice])),
+                                        ->url(ElectronicInvoiceResource::getUrl('view', ['record' => $invoice])),
                                 ])
                                 ->send();
                         } catch (\Throwable $e) {
@@ -816,12 +840,12 @@ class SaleResource extends Resource
     /**
      * Formulario del modal Cobrar (lista, CreateSale, reutilizable).
      *
-     * @return array<\Filament\Forms\Components\Component>
+     * @return array<Component>
      */
     public static function getCobrarFormSchema(Sale $record): array
     {
         $type = filament()->getTenant()?->business_type ?? 'general';
-        $typeEnum = \App\Enums\BusinessType::tryFrom($type);
+        $typeEnum = BusinessType::tryFrom($type);
         $total = (float) ($record->total ?? 0);
 
         return [
@@ -835,7 +859,14 @@ class SaleResource extends Resource
 
             Forms\Components\Select::make('payment_method')
                 ->label('Método de pago')
-                ->options(PaymentMethod::optionsForBusinessType($typeEnum))
+                ->options(function () use ($typeEnum): array {
+                    $methods = PaymentMethod::optionsForBusinessType($typeEnum);
+                    if (! filament()->getTenant()?->hasModule('receivables')) {
+                        unset($methods[PaymentMethod::Credito->value]);
+                    }
+
+                    return $methods;
+                })
                 ->required()
                 ->default(PaymentMethod::Efectivo->value)
                 ->native(false)
@@ -899,7 +930,7 @@ class SaleResource extends Resource
      * Procesa el cobro de una venta existente y redirige al ticket.
      *
      * @param  array<string, mixed>  $data
-     * @return \Illuminate\Http\RedirectResponse|null
+     * @return RedirectResponse|null
      */
     public static function processCobro(Sale $record, array $data)
     {
@@ -1011,7 +1042,15 @@ class SaleResource extends Resource
             return false;
         }
 
+        if (self::financialEditLocked($record)) {
+            return false;
+        }
+
         return auth()->user()?->hasRoleInBusiness(['owner', 'admin']) ?? false;
     }
 
+    public static function financialEditLocked(?Sale $record): bool
+    {
+        return $record !== null && app(SaleFinancialIntegrity::class)->isFrozen($record);
+    }
 }

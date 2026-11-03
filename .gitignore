@@ -2,8 +2,12 @@
 .DS_Store
 .env
 .env.testing
+.env.testing.docker
 .env*
 !.env.example
+!.env.docker.example
+!.env.testing.docker.example
+!.env.production.example
 .env.backup
 .env.production
 .env.staging

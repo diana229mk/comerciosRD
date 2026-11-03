@@ -178,6 +178,8 @@ class SalesDailySummaryService
         $date = ($sale->sold_at ?? $sale->sale_date)?->toDateString() ?? now()->toDateString();
         $branchKey = (string) ($sale->branch_id ?? '');
         $cogs = $this->cogsForSale($sale);
+        $strict = $sale->isCreditSale() && (int) $sale->credit_version === 1;
+        $table = DB::connection()->getQueryGrammar()->wrapTable('sales_daily');
         $delta = [
             'tickets' => $sign,
             'subtotal' => round($sign * (float) $sale->subtotal, 2),
@@ -189,7 +191,7 @@ class SalesDailySummaryService
 
         for ($attempt = 0; $attempt < 3; $attempt++) {
             $affected = DB::update(
-                'UPDATE sales_daily
+                "UPDATE {$table}
                     SET tickets = tickets + ?,
                         subtotal = subtotal + ?,
                         discount = discount + ?,
@@ -197,7 +199,7 @@ class SalesDailySummaryService
                         total = total + ?,
                         cogs = cogs + ?,
                         updated_at = ?
-                  WHERE business_id = ? AND branch_key = ? AND report_date = ?',
+                  WHERE business_id = ? AND branch_key = ? AND report_date = ?",
                 [
                     $delta['tickets'],
                     $delta['subtotal'],
@@ -234,9 +236,16 @@ class SalesDailySummaryService
                 ]);
 
                 return $delta;
-            } catch (QueryException) {
+            } catch (QueryException $exception) {
+                if ($strict && (int) ($exception->errorInfo[1] ?? 0) !== 1062) {
+                    throw $exception;
+                }
                 // carrera: otro cajero insertó la fila; reintentar UPDATE
             }
+        }
+
+        if ($strict) {
+            throw new \RuntimeException('No se pudo confirmar el resumen de la venta a crédito.');
         }
 
         return $delta;

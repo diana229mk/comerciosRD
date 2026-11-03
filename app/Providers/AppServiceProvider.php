@@ -33,7 +33,12 @@ use App\Rules\StrongPassword;
 use App\Services\BranchAccessContext;
 use App\Services\PdoMysqlServerIdentityReader;
 use App\Services\ProductSearchService;
+use App\Services\SaleCheckout;
+use App\Services\SaleCreditService;
+use App\Services\SaleFinancialIntegrity;
+use App\Services\SaleReceivableIntegrity;
 use App\Services\SaleService;
+use App\Services\VerifiedMysqlConnector;
 use App\Support\TestingDatabaseGuard;
 use Filament\Http\Responses\Auth\Contracts\LoginResponse;
 use Illuminate\Cache\RateLimiting\Limit;
@@ -50,6 +55,7 @@ class AppServiceProvider extends ServiceProvider
 {
     public function register(): void
     {
+        $this->app->bind('db.connector.mysql', VerifiedMysqlConnector::class);
         $this->app->singleton(MysqlServerIdentityReader::class, PdoMysqlServerIdentityReader::class);
 
         // FASE H1 · Cache request-scoped del contexto de acceso por sucursal.
@@ -64,6 +70,10 @@ class AppServiceProvider extends ServiceProvider
         // Puertos de escala: POS y cobro hablan con interfaces, no con MySQL.
         $this->app->singleton(ProductSearch::class, ProductSearchService::class);
         $this->app->singleton(RecordsSale::class, SaleService::class);
+        $this->app->scoped(SaleFinancialIntegrity::class);
+        $this->app->scoped(SaleCheckout::class);
+        $this->app->scoped(SaleCreditService::class);
+        $this->app->scoped(SaleReceivableIntegrity::class);
     }
 
     public function boot(): void

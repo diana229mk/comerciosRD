@@ -5,19 +5,66 @@ namespace Tests\Feature;
 use App\Enums\BusinessType;
 use App\Models\Business;
 use App\Models\CashSession;
+use App\Models\Customer;
 use App\Models\Product;
 use App\Models\Quote;
+use App\Models\Receivable;
 use App\Models\Sale;
 use App\Models\User;
+use App\Services\AuthContextResolver;
+use App\Services\PosSessionService;
 use App\Services\QuoteService;
 use App\Services\TwoFactorService;
+use App\Support\TenantContext;
 use Illuminate\Foundation\Testing\DatabaseTransactions;
+use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Str;
 use Tests\TestCase;
 
 class PosApiTest extends TestCase
 {
     use DatabaseTransactions;
+
+    public function test_credit_checkout_replays_the_same_result_without_repricing_or_duplicating_debt(): void
+    {
+        config(['scale.post_sale_queue' => true, 'ecf.enabled' => false]);
+        Queue::fake();
+        $fixture = $this->seedPos();
+        $business = $fixture['business'];
+        $customer = TenantContext::run((string) $business->id,
+            fn () => Customer::create(['name' => 'Cliente POS F2', 'is_active' => true]));
+        $command = [
+            'idempotency_key' => (string) Str::uuid(),
+            'customer_id' => $customer->id, 'payment_method' => 'credito',
+            'items' => [['product_id' => $fixture['product']->id, 'qty' => 1]],
+        ];
+        $url = '/caja/'.$business->slug.'/api/checkout';
+        $first = $this->postJson($url, $command)->assertOk()->assertJsonPath('ok', true);
+        $fixture['product']->forceFill(['stock' => 0, 'price' => 999])->saveQuietly();
+        $this->postJson($url, $command)->assertOk()->assertJsonPath('sale_id', $first->json('sale_id'))
+            ->assertJsonPath('total', $first->json('total'));
+        $this->assertSame(1, Sale::withoutBusinessScope()->where('business_id', $business->id)->count());
+        $this->assertSame(1, Receivable::withoutBusinessScope()->where('business_id', $business->id)->count());
+        $command['items'][0]['qty'] = 2;
+        $this->postJson($url, $command)->assertStatus(422)->assertJsonPath('ok', false)
+            ->assertJsonPath('retry_safe', false);
+    }
+
+    public function test_credit_is_not_offered_or_confirmed_when_receivables_is_disabled(): void
+    {
+        $fixture = $this->seedPos();
+        $business = $fixture['business'];
+        $business->forceFill(['enabled_modules' => ['sales', 'customers', 'cash_register']])->save();
+        $customer = TenantContext::run((string) $business->id,
+            fn () => Customer::create(['name' => 'Cliente sin módulo', 'is_active' => true]));
+        $this->postJson('/caja/'.$business->slug.'/api/checkout', [
+            'idempotency_key' => (string) Str::uuid(), 'customer_id' => $customer->id,
+            'payment_method' => 'credito', 'items' => [['product_id' => $fixture['product']->id, 'qty' => 1]],
+        ])->assertStatus(422)->assertJsonPath('ok', false);
+        $this->assertSame(0, Sale::withoutBusinessScope()->where('business_id', $business->id)->count());
+        $this->assertSame(0, Receivable::withoutBusinessScope()->where('business_id', $business->id)->count());
+        $this->assertArrayNotHasKey('credito', app(PosSessionService::class)->clientConfig($business->fresh())['payment_methods']);
+    }
 
     /**
      * @return array{user: User, business: Business, product: Product}
@@ -112,6 +159,7 @@ class PosApiTest extends TestCase
         ])->assertOk()->assertJsonPath('ok', true);
 
         $response = $this->postJson('/caja/'.$business->slug.'/api/checkout', [
+            'idempotency_key' => (string) Str::uuid(),
             'items' => [[
                 'product_id' => $product->id,
                 'qty' => 2,
@@ -230,9 +278,9 @@ class PosApiTest extends TestCase
         $cashier->businesses()->attach($business->id, ['role' => 'cashier', 'is_active' => true]);
         $this->actingAs($cashier);
 
-        $result = app(\App\Services\AuthContextResolver::class)->apply($cashier, $business);
+        $result = app(AuthContextResolver::class)->apply($cashier, $business);
 
-        $this->assertSame(\App\Services\AuthContextResolver::STATUS_OK, $result['status']);
+        $this->assertSame(AuthContextResolver::STATUS_OK, $result['status']);
         $this->assertStringContainsString('/caja/'.$business->slug, (string) $result['panel_url']);
     }
 
@@ -319,6 +367,7 @@ class PosApiTest extends TestCase
         ['business' => $business, 'product' => $product] = $this->seedPos();
 
         $this->postJson('/caja/'.$business->slug.'/api/checkout', [
+            'idempotency_key' => (string) Str::uuid(),
             'items' => [[
                 'product_id' => $product->id,
                 'qty' => 1,
@@ -407,6 +456,7 @@ class PosApiTest extends TestCase
         ])->assertOk();
 
         $charge = $this->postJson('/caja/'.$business->slug.'/api/checkout', [
+            'idempotency_key' => (string) Str::uuid(),
             'items' => [[
                 'product_id' => $product->id,
                 'qty' => 2,
@@ -461,6 +511,7 @@ class PosApiTest extends TestCase
 
         $this->actingAs($b)
             ->postJson('/caja/'.$business->slug.'/api/checkout', [
+                'idempotency_key' => (string) Str::uuid(),
                 'items' => [['product_id' => $product->id, 'qty' => 1, 'price' => 100]],
                 'payment_method' => 'efectivo',
                 'amount_tendered' => 118,
@@ -486,6 +537,7 @@ class PosApiTest extends TestCase
 
         $this->actingAs($b)
             ->postJson('/caja/'.$business->slug.'/api/checkout', [
+                'idempotency_key' => (string) Str::uuid(),
                 'items' => [['product_id' => $product->id, 'qty' => 1, 'price' => 100]],
                 'payment_method' => 'efectivo',
                 'amount_tendered' => 118,

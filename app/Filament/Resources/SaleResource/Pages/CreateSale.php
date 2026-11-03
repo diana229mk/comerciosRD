@@ -11,11 +11,29 @@ use Filament\Facades\Filament;
 use Filament\Notifications\Notification;
 use Filament\Resources\Pages\CreateRecord;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Str;
+use Livewire\Attributes\Locked;
 use Throwable;
 
 class CreateSale extends CreateRecord
 {
     protected static string $resource = SaleResource::class;
+
+    protected ?bool $hasDatabaseTransactions = true;
+
+    #[Locked]
+    public string $checkoutKey = '';
+
+    public function mount(): void
+    {
+        parent::mount();
+        $this->checkoutKey = (string) Str::uuid();
+    }
+
+    protected function afterCreate(): void
+    {
+        $this->checkoutKey = (string) Str::uuid();
+    }
 
     /**
      * Cobrar desde el header: modal pago → crea venta completada → ticket.
@@ -147,6 +165,7 @@ class CreateSale extends CreateRecord
 
         try {
             return app(SaleService::class)->create([
+                'idempotency_key' => $this->checkoutKey,
                 'business_id' => (string) $businessId,
                 'user_id' => auth()->id(),
                 'customer_id' => $data['customer_id'] ?? null,
@@ -167,7 +186,7 @@ class CreateSale extends CreateRecord
                 ->danger()
                 ->send();
 
-            $this->halt();
+            $this->halt(shouldRollbackDatabaseTransaction: true);
 
             throw $e;
         }

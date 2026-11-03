@@ -2,9 +2,12 @@
 
 namespace App\Models;
 
+use App\Database\FinancialSaleItems;
 use App\Enums\PaymentMethod;
 use App\Enums\SaleStatus;
+use App\Support\Itbis;
 use App\Traits\BelongsToBusiness;
+use App\Traits\ProtectsSaleFinancialWrites;
 use App\Traits\ScopedByBranch;
 use App\Traits\TracksBranch;
 use Illuminate\Database\Eloquent\Builder;
@@ -12,15 +15,17 @@ use Illuminate\Database\Eloquent\Concerns\HasUuids;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Database\Eloquent\Relations\HasOne;
 use Illuminate\Database\Eloquent\SoftDeletes;
 
 class Sale extends Model
 {
     use BelongsToBusiness;
     use HasUuids;
+    use ProtectsSaleFinancialWrites;
     use ScopedByBranch;
-    use TracksBranch;
     use SoftDeletes;
+    use TracksBranch;
 
     protected $fillable = [
         // business_id: lo inyecta BelongsToBusiness
@@ -68,6 +73,8 @@ class Sale extends Model
             'status' => SaleStatus::class,
             'sale_date' => 'datetime',
             'sold_at' => 'datetime',
+            'credit_version' => 'integer',
+            'credit_effects_at' => 'datetime',
         ];
     }
 
@@ -75,7 +82,11 @@ class Sale extends Model
 
     public function items(): HasMany
     {
-        return $this->hasMany(SaleItem::class);
+        $related = $this->newRelatedInstance(SaleItem::class);
+
+        return new FinancialSaleItems(
+            $related->newQuery(), $this, $related->qualifyColumn('sale_id'), $this->getKeyName(),
+        );
     }
 
     /**
@@ -97,7 +108,7 @@ class Sale extends Model
     /**
      * Primer / principal e-CF de la venta (hasOne para UI y validaciones).
      */
-    public function electronicInvoice(): \Illuminate\Database\Eloquent\Relations\HasOne
+    public function electronicInvoice(): HasOne
     {
         return $this->hasOne(ElectronicInvoice::class);
     }
@@ -248,7 +259,7 @@ class Sale extends Model
         $businessType = null;
         try {
             $businessType = $this->business?->business_type
-                ?? \App\Models\Business::withoutGlobalScopes()->find($this->business_id)?->business_type
+                ?? Business::withoutGlobalScopes()->find($this->business_id)?->business_type
                 ?? filament()->getTenant()?->business_type;
         } catch (\Throwable) {
             $businessType = null;
@@ -274,7 +285,7 @@ class Sale extends Model
      */
     public function isCreditSale(): bool
     {
-        return \App\Enums\PaymentMethod::isCreditValue($this->payment_method);
+        return PaymentMethod::isCreditValue($this->payment_method);
     }
 
     public function recalculateTotals(): void
@@ -308,7 +319,7 @@ class Sale extends Model
 
         $discount = (float) $this->discount;
         $taxRate = (float) ($this->tax_rate ?: $business?->taxRate() ?: 18);
-        $totals = \App\Support\Itbis::totalsFromLines($lineSpecs, $discount, $taxRate);
+        $totals = Itbis::totalsFromLines($lineSpecs, $discount, $taxRate);
         $paid = (float) $this->amount_paid;
         $change = max(0, round($paid - $totals['total'], 2));
 
@@ -360,7 +371,7 @@ class Sale extends Model
         });
 
         static::saving(function (Sale $sale): void {
-            if ($sale->sale_number && empty($sale->number)) {
+            if ($sale->sale_number && empty($sale->number) && (! $sale->exists || $sale->isDirty('sale_number'))) {
                 $sale->number = $sale->sale_number;
             }
             if ($sale->isDirty('change')) {

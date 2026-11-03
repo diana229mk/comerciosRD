@@ -34,6 +34,14 @@ return [
         'reports' => env('SCALE_QUEUE_REPORTS', 'reports'),
     ],
 
+    'accounting_outbox' => [
+        'batch_size' => max(1, min(1000, (int) env('ACCOUNTING_OUTBOX_BATCH_SIZE', 100))),
+        'max_publish_attempts' => max(1, (int) env('ACCOUNTING_OUTBOX_MAX_PUBLISH_ATTEMPTS', 10)),
+        'max_processing_attempts' => max(1, (int) env('ACCOUNTING_OUTBOX_MAX_PROCESSING_ATTEMPTS', 10)),
+        'redispatch_after' => max(180, (int) env('ACCOUNTING_OUTBOX_REDISPATCH_AFTER', 180)),
+        'backoff' => max(15, (int) env('ACCOUNTING_OUTBOX_BACKOFF', 30)),
+    ],
+
     /*
      | Driver del puerto App\Contracts\ProductSearch.
      | Hoy solo `mysql`. Mañana `meilisearch` sin tocar el POS.

@@ -13,10 +13,10 @@ use App\Scopes\BranchScope;
  *
  * Modelos objetivo (operaciones): Sale, Order, CashSession, Expense, Purchase.
  *
- * NO se agrega a modelos de inventario (ProductBatch, InventoryMovement,
- * StockCount, StockCountItem): esos ya tienen su propia guarda opt-in vía
- * InventoryService (feature `strict_branch_stock`) y aplicar dos scopes
- * distintos podría ocultar lotes legítimos durante ventas.
+ * ProductBatch e InventoryMovement mantienen su guarda en InventoryService:
+ * aplicarles este scope podría ocultar lotes legítimos durante ventas.
+ * StockCount y StockCountItem sí usan este scope porque cada conteo pertenece
+ * a una sucursal y no debe exponer ni modificar conteos de otras sucursales.
  */
 trait ScopedByBranch
 {

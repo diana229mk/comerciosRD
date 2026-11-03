@@ -88,9 +88,11 @@ class PortabilityCommandTest extends TestCase
     {
         $this->stubIdentities('same-mysql-server');
         $operations = $this->mock(PortabilityRestoreOperations::class);
+        $operations->shouldReceive('verifyBackupIntegrity')->once();
         $operations->shouldReceive('mysqlBinary')->once()->andReturn('');
         $operations->shouldNotReceive('createDatabase');
         $operations->shouldNotReceive('importDump');
+        $operations->shouldNotReceive('ensureDatabaseIsEmpty');
         $operations->shouldNotReceive('extractArchive');
         $directory = $this->backupDirectory();
 
@@ -110,6 +112,7 @@ class PortabilityCommandTest extends TestCase
         $dir = sys_get_temp_dir().'/crd-portability-refuse-'.uniqid();
         mkdir($dir, 0700, true);
         file_put_contents($dir.'/database.sql.gz', gzencode("-- fake\n"));
+        $this->writeChecksums($dir);
 
         try {
             $this->artisan('portability:restore', [
@@ -120,6 +123,69 @@ class PortabilityCommandTest extends TestCase
             @unlink($dir.'/database.sql.gz');
             @rmdir($dir);
         }
+    }
+
+    public function test_restore_rejects_invalid_backup_checksum_before_running_mysql(): void
+    {
+        $this->stubIdentities('different-server-uuid');
+
+        $operations = $this->mock(PortabilityRestoreOperations::class);
+        $operations->shouldReceive('verifyBackupIntegrity')
+            ->once()
+            ->andThrow(new \RuntimeException('Checksum SHA-256 inválido para database.sql.gz.'));
+        $operations->shouldNotReceive('mysqlBinary');
+        $operations->shouldNotReceive('createDatabase');
+        $operations->shouldNotReceive('importDump');
+        $operations->shouldNotReceive('ensureDatabaseIsEmpty');
+        $operations->shouldNotReceive('extractArchive');
+
+        $before = $this->applicationRowCounts();
+        $directory = $this->backupDirectory();
+
+        try {
+            $this->artisan('portability:restore', [
+                '--from' => $directory,
+                '--database' => 'comercios_rd_copy',
+            ])->expectsOutputToContain('Checksum SHA-256 inválido')->assertFailed();
+        } finally {
+            @unlink($directory.'/SHA256SUMS');
+            @unlink($directory.'/database.sql.gz');
+            @rmdir($directory);
+        }
+
+        $this->assertSame($before, $this->applicationRowCounts());
+    }
+
+    public function test_restore_rejects_non_empty_destination_database(): void
+    {
+        $this->stubIdentities('different-server-uuid');
+
+        $operations = $this->mock(PortabilityRestoreOperations::class);
+        $operations->shouldReceive('verifyBackupIntegrity')->once();
+        $operations->shouldReceive('mysqlBinary')->once()->andReturn('/usr/bin/mysql');
+        $operations->shouldNotReceive('createDatabase');
+        $operations->shouldReceive('ensureDatabaseIsEmpty')
+            ->once()
+            ->andThrow(new \RuntimeException("Restauración rechazada: la base destino 'comercios_rd_copy' no está vacía."));
+        $operations->shouldNotReceive('importDump');
+        $operations->shouldNotReceive('dropDatabase');
+        $operations->shouldNotReceive('extractArchive');
+
+        $before = $this->applicationRowCounts();
+        $directory = $this->backupDirectory();
+
+        try {
+            $this->artisan('portability:restore', [
+                '--from' => $directory,
+                '--database' => 'comercios_rd_copy',
+            ])->expectsOutputToContain('no está vacía')->assertFailed();
+        } finally {
+            @unlink($directory.'/SHA256SUMS');
+            @unlink($directory.'/database.sql.gz');
+            @rmdir($directory);
+        }
+
+        $this->assertSame($before, $this->applicationRowCounts());
     }
 
     private function assertRejectedActiveRestore(bool $ontoEmpty): void
@@ -186,8 +252,16 @@ class PortabilityCommandTest extends TestCase
         $directory = sys_get_temp_dir().'/crd-portability-test-'.uniqid();
         mkdir($directory, 0700, true);
         file_put_contents($directory.'/database.sql.gz', gzencode("-- fake\n"));
+        $this->writeChecksums($directory);
 
         return $directory;
+    }
+
+    private function writeChecksums(string $directory): void
+    {
+        $dump = $directory.'/database.sql.gz';
+        $line = hash_file('sha256', $dump).'  database.sql.gz';
+        file_put_contents($directory.'/SHA256SUMS', $line."\n");
     }
 
     private function expectNoRestoreOperations(PortabilityRestoreOperations $operations): void

@@ -3,6 +3,7 @@
 namespace App\Models;
 
 use App\Enums\BusinessType;
+use App\Services\AccountingService;
 use Filament\Models\Contracts\HasAvatar;
 use Filament\Models\Contracts\HasCurrentTenantLabel;
 use Filament\Models\Contracts\HasName;
@@ -718,6 +719,10 @@ class Business extends Model implements HasName, HasAvatar, HasCurrentTenantLabe
     protected static function boot(): void
     {
         parent::boot();
+
+        static::created(function (Business $business): void {
+            AccountingService::createDefaultAccounts($business);
+        });
 
         static::saving(function (Business $business): void {
             $source = trim((string) ($business->slug ?? ''));

@@ -2,12 +2,13 @@
 
 namespace App\Policies;
 
+use App\Models\StockCount;
+use App\Models\StockCountItem;
 use App\Models\User;
-use App\Services\AuthContextResolver;
 use App\Traits\ScopedByBranch;
 use Illuminate\Auth\Access\HandlesAuthorization;
-use Illuminate\Database\Eloquent\Model;
 use Illuminate\Auth\Access\Response;
+use Illuminate\Database\Eloquent\Model;
 
 abstract class TenantPolicy
 {
@@ -71,13 +72,17 @@ abstract class TenantPolicy
         $snapshot = app(\App\Services\BranchAccessContext::class)
             ->resolveFor($user, (string) $businessId);
 
-        if ($snapshot === null || ! $snapshot->shouldRestrictReads()) {
+        if (! $snapshot->shouldRestrictReads()) {
             return null;
         }
 
         $recordBranchId = $record->getAttribute('branch_id');
-        // NULL histórico: no bloquear (consistente con BranchScope S4a).
         if ($recordBranchId === null || $recordBranchId === '') {
+            if ($record instanceof StockCount || $record instanceof StockCountItem) {
+                return Response::denyAsNotFound();
+            }
+
+            // Otros registros históricos sin sucursal permanecen compartidos.
             return null;
         }
 
@@ -161,4 +166,3 @@ abstract class TenantPolicy
             : Response::denyAsNotFound();
     }
 }
-

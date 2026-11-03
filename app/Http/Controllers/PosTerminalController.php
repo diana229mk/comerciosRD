@@ -8,6 +8,8 @@ use App\Services\CashSessionService;
 use App\Services\PosSessionService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Validation\ValidationException;
 use Illuminate\View\View;
 use InvalidArgumentException;
 use RuntimeException;
@@ -80,10 +82,22 @@ class PosTerminalController extends Controller
     public function checkout(Request $request, string $tenant, PosSessionService $pos): JsonResponse
     {
         try {
-            $sale = $pos->checkout($this->business($request), $request->all());
-        } catch (InvalidArgumentException|RuntimeException $e) {
+            $business = $this->business($request);
+            $sale = $pos->checkout($business, $request->all());
+        } catch (InvalidArgumentException|ValidationException $e) {
+            $retrySafe = false;
+            try {
+                $retrySafe = isset($business) && DB::transactionLevel() === 0
+                    && ! DB::table('sale_checkout_requests')
+                        ->where('business_id', $business->id)
+                        ->where('request_key', (string) $request->input('idempotency_key'))->exists();
+            } catch (Throwable) {
+                // An unknown commit outcome must retain the original request identity.
+            }
+
             return response()->json([
                 'ok' => false,
+                'retry_safe' => $retrySafe,
                 'title' => 'No se pudo completar la venta',
                 'message' => $e->getMessage(),
             ], 422);
@@ -93,7 +107,7 @@ class PosTerminalController extends Controller
             return response()->json([
                 'ok' => false,
                 'title' => 'No se pudo completar la venta',
-                'message' => $e->getMessage(),
+                'message' => 'No se pudo confirmar el resultado. Reintenta la misma solicitud, no generes otra venta.',
             ], 422);
         }
 

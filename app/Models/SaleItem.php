@@ -3,6 +3,7 @@
 namespace App\Models;
 
 use App\Traits\BelongsToBusiness;
+use App\Traits\ProtectsSaleFinancialWrites;
 use Illuminate\Database\Eloquent\Concerns\HasUuids;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
@@ -12,6 +13,7 @@ class SaleItem extends Model
 {
     use BelongsToBusiness;
     use HasUuids;
+    use ProtectsSaleFinancialWrites;
 
     protected $fillable = [
         // business_id: trait / hereda de Sale

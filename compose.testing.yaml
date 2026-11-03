@@ -1,0 +1,245 @@
+name: comercios-rd-isolated-tests
+
+services:
+  test-mysql:
+    image: mysql:8.4
+    restart: "no"
+    environment:
+      MYSQL_DATABASE: comercios_rd_storage_test
+      MYSQL_USER: comercios_storage_test
+      MYSQL_PASSWORD: ${COMERCIOS_TEST_DB_PASSWORD:?Set COMERCIOS_TEST_DB_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${COMERCIOS_TEST_MYSQL_ROOT_PASSWORD:?Set COMERCIOS_TEST_MYSQL_ROOT_PASSWORD}
+    volumes:
+      - isolated_test_mysql_data:/var/lib/mysql
+      - ./docker/testing/restrict-test-user.sql:/docker-entrypoint-initdb.d/10-restrict-test-user.sql:ro
+    networks:
+      - isolated_test_backend
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - mysqladmin ping --host=127.0.0.1 --silent
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+
+  test-redis:
+    profiles:
+      - accounting-testing
+    image: redis:7.4-alpine
+    restart: "no"
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+    tmpfs:
+      - /data:size=16m,mode=1777
+    networks:
+      - isolated_test_backend
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  phpunit:
+    profiles:
+      - testing
+    build:
+      context: .
+      dockerfile: Dockerfile.testing
+    restart: "no"
+    environment:
+      APP_ENV: testing
+      APP_DEBUG: "false"
+      DB_CONNECTION: mysql
+      DB_HOST: test-mysql
+      DB_PORT: "3306"
+      DB_DATABASE: comercios_rd_storage_test
+      DB_URL: ""
+      DB_TEST_USERNAME: comercios_storage_test
+      DB_TEST_PASSWORD: ${COMERCIOS_TEST_DB_PASSWORD:?Set COMERCIOS_TEST_DB_PASSWORD}
+    depends_on:
+      test-mysql:
+        condition: service_healthy
+    networks:
+      - isolated_test_backend
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    command:
+      - php
+      - artisan
+      - test
+
+  phpunit-accounting:
+    extends:
+      service: phpunit
+    profiles:
+      - accounting-testing
+    image: comercios-rd-isolated-tests-phpunit:latest
+    environment:
+      ACCOUNTING_QUEUE_INTEGRATION: "1"
+      APP_KEY: base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+      CACHE_STORE: array
+      SESSION_DRIVER: array
+      REDIS_CLIENT: phpredis
+      REDIS_HOST: test-redis
+      REDIS_PORT: "6379"
+      REDIS_URL: ""
+      REDIS_USERNAME: ""
+      REDIS_PASSWORD: ""
+      REDIS_DB: "15"
+      REDIS_PREFIX: comercios_rd_accounting_test_
+    depends_on:
+      test-redis:
+        condition: service_healthy
+    command:
+      - php
+      - tests/Fixtures/accounting-queue-preflight.php
+
+  phpunit-portability:
+    profiles:
+      - portability-testing
+    image: comercios-rd-isolated-tests-phpunit:latest
+    restart: "no"
+    environment:
+      APP_ENV: testing
+      PORTABILITY_MYSQL_INTEGRATION: "1"
+      PORTABILITY_TEST_MYSQL_HOST: test-mysql
+      PORTABILITY_TEST_MYSQL_PASSWORD: ${COMERCIOS_TEST_MYSQL_ROOT_PASSWORD:?Set COMERCIOS_TEST_MYSQL_ROOT_PASSWORD}
+    depends_on:
+      test-mysql:
+        condition: service_healthy
+    networks:
+      - isolated_test_backend
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    command:
+      - ./vendor/bin/phpunit
+      - tests/Integration/PortabilityMysqlRestoreTest.php
+
+  tls-certificates:
+    profiles: [tls-testing]
+    image: comercios-rd-isolated-tests-phpunit:latest
+    user: "0:0"
+    restart: "no"
+    environment:
+      APP_ENV: testing
+      MYSQL_TLS_INTEGRATION: "1"
+      DB_TEST_PASSWORD: ${COMERCIOS_TEST_DB_PASSWORD:?Set COMERCIOS_TEST_DB_PASSWORD}
+    volumes:
+      - isolated_test_tls_certs:/tls-certs
+    networks: [isolated_test_backend]
+    command: [php, tests/Fixtures/mysql-tls-certificates.php]
+
+  test-mysql-tls:
+    profiles: [tls-testing]
+    image: mysql:8.4
+    restart: "no"
+    entrypoint: ["/bin/sh", "/mysql-tls-server-entrypoint.sh"]
+    environment:
+      MYSQL_DATABASE: comercios_rd_storage_test
+      MYSQL_USER: comercios_storage_test
+      MYSQL_PASSWORD: ${COMERCIOS_TEST_DB_PASSWORD:?Set COMERCIOS_TEST_DB_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${COMERCIOS_TEST_MYSQL_ROOT_PASSWORD:?Set COMERCIOS_TEST_MYSQL_ROOT_PASSWORD}
+    command:
+      - --ssl-ca=/tls-certs/ca.pem
+      - --ssl-cert=/tls-certs/server.pem
+      - --ssl-key=/tls-certs/server.key
+      - --require-secure-transport=ON
+    volumes:
+      - isolated_test_tls_certs:/tls-certs:ro
+      - ./docker/testing/restrict-test-user.sql:/docker-entrypoint-initdb.d/10-restrict-test-user.sql:ro
+      - ./docker/testing/mysql-tls-client-check.sh:/mysql-tls-client-check.sh:ro
+      - ./docker/testing/mysql-tls-server-entrypoint.sh:/mysql-tls-server-entrypoint.sh:ro
+    tmpfs:
+      - /var/lib/mysql:size=1g
+    networks:
+      isolated_test_backend:
+        aliases: [wrong-mysql-tls]
+    depends_on:
+      tls-certificates:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          mysql --defaults-file=/tls-certs/client.cnf --no-login-paths
+          --protocol=TCP --host=test-mysql-tls --connect-timeout=3
+          --ssl-mode=VERIFY_IDENTITY --ssl-ca=/tls-certs/ca.pem
+          --batch --skip-column-names
+          -e "SHOW SESSION STATUS LIKE 'Ssl_cipher'" |
+          grep -Eq '^Ssl_cipher[[:space:]]+[^[:space:]]+'
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
+
+  test-mysql-no-tls:
+    profiles: [tls-testing]
+    image: mysql:8.4
+    restart: "no"
+    environment:
+      MYSQL_DATABASE: comercios_rd_storage_test
+      MYSQL_USER: comercios_storage_test
+      MYSQL_PASSWORD: ${COMERCIOS_TEST_DB_PASSWORD:?Set COMERCIOS_TEST_DB_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${COMERCIOS_TEST_MYSQL_ROOT_PASSWORD:?Set COMERCIOS_TEST_MYSQL_ROOT_PASSWORD}
+    command: ["--tls-version="]
+    volumes:
+      - ./docker/testing/restrict-test-user.sql:/docker-entrypoint-initdb.d/10-restrict-test-user.sql:ro
+    tmpfs:
+      - /var/lib/mysql:size=1g
+    networks: [isolated_test_backend]
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping --host=127.0.0.1 --silent"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
+
+  phpunit-tls:
+    profiles: [tls-testing]
+    image: comercios-rd-isolated-tests-phpunit:latest
+    restart: "no"
+    environment:
+      APP_ENV: testing
+      APP_DEBUG: "false"
+      DB_CONNECTION: mysql
+      DB_HOST: test-mysql-tls
+      DB_PORT: "3306"
+      DB_DATABASE: comercios_rd_storage_test
+      DB_URL: ""
+      DB_TEST_USERNAME: comercios_storage_test
+      DB_TEST_PASSWORD: ${COMERCIOS_TEST_DB_PASSWORD:?Set COMERCIOS_TEST_DB_PASSWORD}
+      DB_SOCKET: ""
+      MYSQL_TLS_INTEGRATION: "1"
+      MYSQL_SSL_REQUIRED: "true"
+      MYSQL_ATTR_SSL_CA: /tls-certs/ca.pem
+      CACHE_STORE: array
+      SESSION_DRIVER: array
+      APP_KEY: base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+    volumes:
+      - isolated_test_tls_certs:/tls-certs:ro
+    networks: [isolated_test_backend]
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    depends_on:
+      test-mysql-tls:
+        condition: service_healthy
+      test-mysql-no-tls:
+        condition: service_healthy
+    command: [php, tests/Fixtures/mysql-tls-preflight.php]
+
+networks:
+  isolated_test_backend:
+    name: comercios_rd_isolated_test_backend
+    driver: bridge
+    internal: true
+
+volumes:
+  isolated_test_mysql_data:
+    name: comercios_rd_isolated_test_mysql
+  isolated_test_tls_certs:
+    name: comercios_rd_isolated_test_tls_certs_sha256

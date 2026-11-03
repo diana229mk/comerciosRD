@@ -9,6 +9,7 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Eloquent\SoftDeletes;
+use Illuminate\Support\Facades\DB;
 
 class JournalEntry extends Model
 {
@@ -84,18 +85,26 @@ class JournalEntry extends Model
         $year = now()->year;
         $prefix = 'ASI-'.$year.'-';
 
-        $last = self::withoutBusinessScope()
-            ->where('business_id', $businessId)
-            ->where('entry_number', 'like', $prefix.'%')
-            ->orderByDesc('entry_number')
-            ->value('entry_number');
+        return DB::transaction(function () use ($businessId, $year, $prefix): string {
+            DB::table('accounting_sequences')->insertOrIgnore([
+                'business_id' => $businessId, 'year' => $year, 'last_number' => 0,
+            ]);
+            $counter = DB::table('accounting_sequences')
+                ->where('business_id', $businessId)->where('year', $year)
+                ->lockForUpdate()->first();
+            $existing = self::withoutBusinessScope()->withTrashed()
+                ->where('business_id', $businessId)
+                ->where('entry_number', 'like', $prefix.'%')
+                ->whereRaw('entry_number REGEXP ?', ['^'.$prefix.'[0-9]+$'])
+                ->selectRaw('MAX(CAST(SUBSTRING(entry_number, ?) AS UNSIGNED)) AS last_number', [strlen($prefix) + 1])
+                ->value('last_number');
+            $next = max((int) $counter->last_number, (int) $existing) + 1;
+            DB::table('accounting_sequences')
+                ->where('business_id', $businessId)->where('year', $year)
+                ->update(['last_number' => $next]);
 
-        $next = 1;
-        if (is_string($last) && preg_match('/ASI-\d{4}-(\d+)/', $last, $matches)) {
-            $next = (int) $matches[1] + 1;
-        }
-
-        return $prefix.str_pad((string) $next, 5, '0', STR_PAD_LEFT);
+            return $prefix.str_pad((string) $next, 5, '0', STR_PAD_LEFT);
+        });
     }
 
     public function recalculateTotals(): void

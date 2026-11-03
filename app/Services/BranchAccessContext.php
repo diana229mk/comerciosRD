@@ -4,6 +4,7 @@ namespace App\Services;
 
 use App\Models\Business;
 use App\Models\User;
+use Illuminate\Auth\Access\AuthorizationException;
 
 /**
  * FASE H1 — Cache request-scoped del contexto de acceso por sucursal.
@@ -32,33 +33,24 @@ class BranchAccessContext
     /**
      * Cache por clave "userId:businessId".
      *
-     * @var array<string, BranchAccessSnapshot|false>
+     * @var array<string, BranchAccessSnapshot>
      */
     private array $cache = [];
 
     /**
-     * Devuelve el snapshot para el (user, business) dado, o null si no aplica
-     * ninguna guarda (usuario no autenticado, negocio sin la feature, etc).
-     *
-     * NUNCA lanza. Falla-seguro devolviendo null (no filtra nada).
+     * Devuelve el snapshot del usuario para el negocio.
      */
-    public function resolveFor(User $user, string $businessId): ?BranchAccessSnapshot
+    public function resolveFor(User $user, string $businessId): BranchAccessSnapshot
     {
         $key = $user->getKey().':'.$businessId;
 
         if (array_key_exists($key, $this->cache)) {
-            return $this->cache[$key] ?: null;
+            return $this->cache[$key];
         }
 
-        try {
-            $snapshot = $this->build($user, $businessId);
-        } catch (\Throwable) {
-            $snapshot = null;
-        }
+        $this->cache[$key] = $this->build($user, $businessId);
 
-        $this->cache[$key] = $snapshot ?? false;
-
-        return $snapshot;
+        return $this->cache[$key];
     }
 
     /**
@@ -88,23 +80,28 @@ class BranchAccessContext
         return count($this->cache);
     }
 
-    private function build(User $user, string $businessId): ?BranchAccessSnapshot
+    private function build(User $user, string $businessId): BranchAccessSnapshot
     {
         /** @var ?Business $business */
         $business = Business::query()->find($businessId);
         if (! $business instanceof Business) {
-            return null;
+            throw new AuthorizationException('No se pudo verificar el negocio solicitado.');
         }
 
         $featureEnabled = $business->hasFeature('strict_branch_scope');
 
         $isOwner = (string) ($business->owner_id ?? '') === (string) $user->getKey();
+        $isMasterAdmin = (bool) $user->is_master_admin;
+
+        if (! $isOwner && ! $isMasterAdmin && ! $user->canAccessTenant($business)) {
+            throw new AuthorizationException('El usuario no tiene acceso al negocio solicitado.');
+        }
 
         $pivot = null;
         $role = null;
         $branchId = null;
 
-        if (! $isOwner) {
+        if (! $isOwner && ! $isMasterAdmin) {
             $pivot = $user->businesses()
                 ->where('businesses.id', $businessId)
                 ->first()
@@ -116,9 +113,13 @@ class BranchAccessContext
             }
         }
 
-        $isAdmin = $isOwner || in_array($role, self::ADMIN_ROLES, true);
+        $isAdmin = $isOwner || $isMasterAdmin || in_array($role, self::ADMIN_ROLES, true);
         $assignedBranch = $branchId !== null && $branchId !== '' ? (string) $branchId : null;
-        $canSwitch = $isOwner || ($isAdmin && $assignedBranch === null);
+        $canSwitch = $isOwner || $isMasterAdmin || ($isAdmin && $assignedBranch === null);
+
+        if ($featureEnabled && ! $isAdmin && $assignedBranch === null) {
+            throw new AuthorizationException('El usuario no tiene una sucursal asignada.');
+        }
 
         $viewBranchId = null;
         $sessionBranch = session(\App\Services\AuthContextResolver::SESSION_BRANCH_ID);
@@ -130,11 +131,22 @@ class BranchAccessContext
             $viewBranchId = $assignedBranch;
         }
 
+        foreach (array_filter([$assignedBranch, $viewBranchId]) as $branchIdToValidate) {
+            $branchExists = \App\Models\Branch::withoutBusinessScope()
+                ->where('business_id', $businessId)
+                ->whereKey($branchIdToValidate)
+                ->exists();
+
+            if (! $branchExists) {
+                throw new AuthorizationException('La sucursal solicitada no pertenece al negocio.');
+            }
+        }
+
         return new BranchAccessSnapshot(
             businessId: $businessId,
             featureEnabled: $featureEnabled,
             isAdmin: $isAdmin,
-            role: $isOwner ? 'owner' : $role,
+            role: $isOwner ? 'owner' : ($isMasterAdmin ? 'master_admin' : $role),
             branchId: $assignedBranch,
             viewBranchId: $viewBranchId,
             canSwitchBranches: $canSwitch,

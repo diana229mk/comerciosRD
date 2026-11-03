@@ -8,10 +8,12 @@ use App\Filament\Resources\EcfSequenceResource;
 use App\Filament\Resources\ElectronicInvoiceResource;
 use App\Jobs\IssueElectronicInvoiceJob;
 use App\Jobs\PostSaleAccountingJob;
+use App\Models\AccountingOutbox;
 use App\Models\Business;
-use App\Models\ElectronicInvoice;
 use App\Models\EcfSequence;
+use App\Models\ElectronicInvoice;
 use App\Models\Sale;
+use App\Services\AccountingOutboxService;
 use App\Services\DgiiSubmissionService;
 use App\Services\EcfService;
 use App\Services\EcfXmlGenerator;
@@ -115,12 +117,16 @@ class EcfDisabledTest extends TestCase
         $sale = new Sale;
         $sale->id = 'sale-id';
         $sale->business_id = 'business-id';
+        $event = new AccountingOutbox;
+        $outbox = \Mockery::mock(AccountingOutboxService::class);
+        $outbox->shouldReceive('register')->once()->with($sale)->andReturn($event);
+        $outbox->shouldReceive('dispatchAfterCommit')->once()->with($event);
+        $this->app->instance(AccountingOutboxService::class, $outbox);
 
         IssueElectronicInvoiceJob::dispatchFor($sale);
         PostSaleAccountingJob::dispatchFor($sale);
         (new IssueElectronicInvoiceJob('business-id', 'sale-id'))->handle();
 
         Bus::assertNotDispatched(IssueElectronicInvoiceJob::class);
-        Bus::assertDispatched(PostSaleAccountingJob::class);
     }
 }

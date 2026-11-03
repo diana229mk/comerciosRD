@@ -1,0 +1,82 @@
+# syntax=docker/dockerfile:1.7
+
+FROM php:8.3-cli-bookworm
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libcurl4 \
+        libfreetype6 \
+        libicu72 \
+        libjpeg62-turbo \
+        libonig5 \
+        libpng16-16 \
+        libxml2 \
+        libzip4 \
+        default-mysql-client \
+        git \
+        libcurl4-openssl-dev \
+        libfreetype6-dev \
+        libicu-dev \
+        libjpeg62-turbo-dev \
+        libonig-dev \
+        libpng-dev \
+        libxml2-dev \
+        libzip-dev \
+        unzip \
+    && docker-php-ext-configure gd --with-freetype --with-jpeg \
+    && docker-php-ext-install -j"$(nproc)" \
+        bcmath \
+        curl \
+        exif \
+        gd \
+        intl \
+        mbstring \
+        opcache \
+        pcntl \
+        pdo_mysql \
+        zip \
+        xml \
+    && pecl install redis-6.2.0 \
+    && docker-php-ext-enable redis \
+    && apt-get purge -y --auto-remove \
+        libcurl4-openssl-dev \
+        libfreetype6-dev \
+        libicu-dev \
+        libjpeg62-turbo-dev \
+        libonig-dev \
+        libpng-dev \
+        libxml2-dev \
+        libzip-dev \
+    && rm -rf /var/lib/apt/lists/* /tmp/pear
+
+COPY --from=composer:2.8 /usr/bin/composer /usr/local/bin/composer
+
+WORKDIR /var/www/html
+
+COPY composer.json composer.lock ./
+RUN composer install \
+    --no-interaction \
+    --no-scripts \
+    --no-plugins \
+    --prefer-dist \
+    --optimize-autoloader
+
+COPY --chown=www-data:www-data . .
+
+RUN mkdir -p \
+        storage/app/public \
+        storage/app/private \
+        storage/framework/cache/data \
+        storage/framework/sessions \
+        storage/framework/views \
+        public \
+        storage/logs \
+        bootstrap/cache \
+    && ln -s ../storage/app/public public/storage \
+    && chown -R www-data:www-data storage bootstrap/cache \
+    && APP_ENV=testing APP_KEY=base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \
+        php artisan package:discover --ansi
+
+USER www-data
+
+CMD ["php", "artisan", "test"]

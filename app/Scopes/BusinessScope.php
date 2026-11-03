@@ -2,6 +2,7 @@
 
 namespace App\Scopes;
 
+use App\Support\TenantContext;
 use Filament\Facades\Filament;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
@@ -12,10 +13,11 @@ use RuntimeException;
  * Global Scope reforzado de aislamiento multi-tenant.
  *
  * Cadena de resolución del business_id:
- *  1) Filament::getTenant()          — contexto del panel (preferido)
- *  2) app('currentBusinessId')       — bind del middleware
- *  3) session('current_business_id') — fallback API / HTTP
- *  4) auth()->user()->current_business_id — último recurso
+ *  1) TenantContext explícito verificado — operaciones internas delimitadas
+ *  2) Filament::getTenant()               — contexto del panel
+ *  3) app('currentBusinessId')            — bind del middleware
+ *  4) session('current_business_id')      — fallback API / HTTP
+ *  5) auth()->user()->current_business_id — último recurso
  *
  * En producción, si hay usuario autenticado (no master) y NO hay tenant
  * resuelto, se lanza excepción (fail-closed). Nunca se deja pasar un
@@ -52,6 +54,13 @@ class BusinessScope implements Scope
      */
     protected function resolveBusinessId(): ?string
     {
+        if (app()->bound(TenantContext::EXPLICIT_BUSINESS_ID)) {
+            $explicitBusinessId = app(TenantContext::EXPLICIT_BUSINESS_ID);
+            if ($explicitBusinessId !== null && $explicitBusinessId !== '') {
+                return (string) $explicitBusinessId;
+            }
+        }
+
         // 1) Tenant activo de Filament
         if (class_exists(Filament::class)) {
             try {

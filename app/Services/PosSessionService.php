@@ -6,16 +6,18 @@ use App\Contracts\ProductSearch;
 use App\Contracts\RecordsSale;
 use App\Enums\BusinessType;
 use App\Enums\PaymentMethod;
+use App\Models\Branch;
 use App\Models\Business;
 use App\Models\Customer;
 use App\Models\Product;
 use App\Models\ProductVariant;
 use App\Models\Quote;
 use App\Models\Sale;
+use App\Models\User;
+use App\Support\Itbis;
 use App\Support\ScaleMetrics;
-use App\Services\AuthContextResolver;
+use Illuminate\Support\Str;
 use InvalidArgumentException;
-use RuntimeException;
 
 /**
  * Lógica de caja sin estado de servidor.
@@ -40,7 +42,7 @@ class PosSessionService
         $cash = app(CashSessionService::class)->posSnapshot();
         $branchId = session(AuthContextResolver::SESSION_BRANCH_ID);
         $branchName = is_string($branchId) && $branchId !== ''
-            ? \App\Models\Branch::query()->whereKey($branchId)->value('name')
+            ? Branch::query()->whereKey($branchId)->value('name')
             : null;
 
         return [
@@ -65,7 +67,8 @@ class PosSessionService
             'quotes_url' => $this->quotesEnabled($business)
                 ? url('/admin/'.$business->slug.'/quotes')
                 : null,
-            'payment_methods' => PaymentMethod::optionsForBusinessType($type),
+            'payment_methods' => $this->paymentMethods($business, $type),
+            'cashier_id' => (string) auth()->id(),
             'customers' => Customer::query()
                 ->active()
                 ->orderBy('name')
@@ -124,7 +127,7 @@ class PosSessionService
         $type = $business->type instanceof BusinessType ? $business->type : null;
 
         return ScaleMetrics::time('pos.scan', function () use ($business, $code, $type): array {
-            if (\Illuminate\Support\Str::isUuid($code)) {
+            if (Str::isUuid($code)) {
                 $byId = Product::query()->active()->whereKey($code)->first();
                 if ($byId) {
                     $blocked = $this->pharmacyBlock($business, $byId);
@@ -265,6 +268,25 @@ class PosSessionService
      */
     public function checkout(Business $business, array $payload): Sale
     {
+        $command = [
+            'entry' => 'pos', 'user_id' => (string) auth()->id(),
+            'payment_method' => PaymentMethod::normalize($payload['payment_method'] ?? null)->value,
+            'customer_id' => $payload['customer_id'] ?? null,
+            'amount_tendered' => $payload['amount_tendered'] ?? null,
+            'quote_id' => $payload['quote_id'] ?? null,
+            'items' => array_map(fn (array $row) => [
+                'product_id' => $row['product_id'] ?? null, 'variant_id' => $row['variant_id'] ?? null,
+                'qty' => (float) ($row['qty'] ?? $row['quantity'] ?? 0),
+            ], is_array($payload['items'] ?? null) ? $payload['items'] : []),
+        ];
+
+        return app(SaleCheckout::class)->run((string) $business->id,
+            (string) ($payload['idempotency_key'] ?? ''), $command,
+            fn () => $this->performCheckout($business, $payload));
+    }
+
+    protected function performCheckout(Business $business, array $payload): Sale
+    {
         return ScaleMetrics::time('pos.checkout', function () use ($business, $payload): Sale {
             $items = $payload['items'] ?? [];
             if (! is_array($items) || $items === []) {
@@ -354,7 +376,7 @@ class PosSessionService
             }
 
             $discount = (float) ($quote?->discount ?? 0);
-            $total = \App\Support\Itbis::totalsFromLines($lineSpecs, $discount, $taxRate)['total'];
+            $total = Itbis::totalsFromLines($lineSpecs, $discount, $taxRate)['total'];
             $tendered = isset($payload['amount_tendered']) ? (float) $payload['amount_tendered'] : null;
 
             if ($method === PaymentMethod::Efectivo) {
@@ -410,7 +432,7 @@ class PosSessionService
 
         $user = auth()->user();
 
-        return $user instanceof \App\Models\User && $user->canPerform('view_orders');
+        return $user instanceof User && $user->canPerform('view_orders');
     }
 
     /**
@@ -453,7 +475,7 @@ class PosSessionService
             throw new InvalidArgumentException('Este negocio no usa cotizaciones.');
         }
         $user = auth()->user();
-        if (! $user instanceof \App\Models\User) {
+        if (! $user instanceof User) {
             throw new InvalidArgumentException('Debes iniciar sesión.');
         }
         if ($write && ! $user->canPerform('create_orders')) {
@@ -473,7 +495,7 @@ class PosSessionService
         if (! $business->hasModule('quotes')) {
             throw new InvalidArgumentException('Este negocio no usa cotizaciones.');
         }
-        $quote = Quote::query()->whereKey($id)->first();
+        $quote = Quote::query()->where('business_id', $business->id)->whereKey($id)->lockForUpdate()->first();
         if (! $quote) {
             throw new InvalidArgumentException('Cotización no encontrada.');
         }
@@ -482,6 +504,16 @@ class PosSessionService
         }
 
         return $quote;
+    }
+
+    private function paymentMethods(Business $business, ?BusinessType $type): array
+    {
+        $methods = PaymentMethod::optionsForBusinessType($type);
+        if (! $business->hasModule('receivables')) {
+            unset($methods[PaymentMethod::Credito->value]);
+        }
+
+        return $methods;
     }
 
     /**

@@ -8,6 +8,7 @@ use App\Enums\SaleStatus;
 use App\Models\Account;
 use App\Models\Business;
 use App\Models\CashSession;
+use App\Models\Customer;
 use App\Models\Expense;
 use App\Models\InventoryMovement;
 use App\Models\JournalEntry;
@@ -24,16 +25,211 @@ use App\Services\AccountingService;
 use App\Services\ControlledDrugLedgerService;
 use App\Services\JournalEntryService;
 use App\Services\ReportsService;
+use App\Services\SaleFinancialIntegrity;
 use App\Services\SaleService;
+use App\Support\TenantContext;
 use Illuminate\Foundation\Testing\DatabaseTransactions;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Str;
+use Illuminate\Validation\ValidationException;
+use PHPUnit\Framework\Attributes\DataProvider;
 use Symfony\Component\HttpKernel\Exception\HttpException;
 use Tests\TestCase;
 
 class FinancialOperationsTest extends TestCase
 {
     use DatabaseTransactions;
+
+    #[DataProvider('confirmedFinancialWrites')]
+    public function test_confirmed_sale_rejects_financial_writes_without_changing_ledger_or_cash(string $operation): void
+    {
+        $fixture = $this->saleFixture(openCashSession: true);
+        $sale = $fixture['sale'];
+        $item = $fixture['item'];
+        AccountingService::createFromSale($sale);
+        $entry = JournalEntry::query()->where('reference', 'Venta #'.$sale->sale_number)->sole();
+        $before = [$sale->fresh()->getAttributes(), $item->fresh()->getAttributes(),
+            $entry->fresh()->getAttributes(), $entry->lines()->orderBy('id')->get()->toArray(),
+            $fixture['cash_session']->fresh()->getAttributes()];
+        $write = match ($operation) {
+            'save' => fn () => $sale->update(['payment_method' => 'transferencia']),
+            'quiet' => fn () => $sale->forceFill(['total' => 1])->saveQuietly(),
+            'without-events' => fn () => Sale::withoutEvents(fn () => $sale->update(['discount' => 10])),
+            'soft-delete' => fn () => $sale->delete(),
+            'force-delete' => fn () => $sale->forceDelete(),
+            'bulk' => fn () => Sale::query()->whereKey($sale->id)->update(['total' => 1]),
+            'base-query' => fn () => Sale::query()->whereKey($sale->id)->toBase()->update(['payment_method' => 'transferencia']),
+            'uppercase' => fn () => Sale::query()->whereKey($sale->id)->getQuery()->update(['TOTAL' => 1]),
+            'get-query' => fn () => Sale::query()->whereKey($sale->id)->getQuery()->increment('total'),
+            'upsert' => fn () => Sale::query()->upsert([['id' => $sale->id, 'total' => 1]], ['id'], ['total']),
+            'item-update' => fn () => $item->update(['quantity' => 1]),
+            'item-quiet' => fn () => $item->forceFill(['unit_cost' => 99])->saveQuietly(),
+            'item-delete' => fn () => $item->deleteQuietly(),
+            'item-bulk' => fn () => $sale->items()->update(['quantity' => 1]),
+            'item-create' => fn () => $sale->items()->create(['product_id' => $fixture['product']->id, 'quantity' => 1, 'unit_price' => 100]),
+            'item-many' => fn () => $sale->items()->createMany([['product_id' => $fixture['product']->id, 'quantity' => 1, 'unit_price' => 100]]),
+            'destroy' => fn () => SaleItem::destroy($item->id),
+        };
+        try {
+            $write();
+            $this->fail('Confirmed financial data must not be writable.');
+        } catch (ValidationException) {
+            $this->assertSame($before, [$sale->fresh()->getAttributes(), $item->fresh()->getAttributes(),
+                $entry->fresh()->getAttributes(), $entry->lines()->orderBy('id')->get()->toArray(),
+                $fixture['cash_session']->fresh()->getAttributes()]);
+        }
+        $this->assertSame(1, $sale->items()->count());
+    }
+
+    public static function confirmedFinancialWrites(): array
+    {
+        return array_map(fn ($operation) => [$operation], [
+            'save', 'quiet', 'without-events', 'soft-delete', 'force-delete', 'bulk', 'base-query', 'uppercase',
+            'get-query', 'upsert', 'item-update', 'item-quiet', 'item-delete', 'item-bulk',
+            'item-create', 'item-many', 'destroy',
+        ]);
+    }
+
+    public function test_cancelled_sale_cannot_be_reopened_for_financial_editing(): void
+    {
+        $fixture = $this->saleFixture();
+        $sale = $fixture['sale'];
+        $sale->forceFill(['status' => SaleStatus::Anulada])->saveQuietly();
+        try {
+            $sale->forceFill(['payment_method' => 'transferencia', 'status' => SaleStatus::Completada])->save();
+            $this->fail('Cancellation must not unlock financial fields.');
+        } catch (ValidationException) {
+            $this->assertSame(SaleStatus::Anulada, $sale->fresh()->status);
+            $this->assertSame(PaymentMethod::Efectivo, $sale->fresh()->payment_method);
+        }
+    }
+
+    public function test_existing_sale_cannot_borrow_a_new_sale_construction_scope(): void
+    {
+        $fixture = $this->saleFixture();
+        $existing = $fixture['sale'];
+        $new = $existing->replicate()->forceFill(['sale_number' => 'NEW-SCOPE', 'number' => 'NEW-SCOPE']);
+        try {
+            Sale::withoutEvents(fn () => app(SaleFinancialIntegrity::class)->construct($new, function () use ($existing): void {
+                $existing->forceFill(['total' => 1])->saveQuietly();
+            }));
+            $this->fail('Only the new sale may be assembled.');
+        } catch (ValidationException) {
+            $this->assertFalse(Sale::query()->where('sale_number', 'NEW-SCOPE')->exists());
+            $this->assertSame(236.0, (float) $existing->fresh()->total);
+        }
+    }
+
+    public function test_notes_remain_editable_but_an_existing_transaction_does_not_unlock_lines(): void
+    {
+        $fixture = $this->saleFixture();
+        $fixture['sale']->update(['notes' => 'Nota administrativa']);
+        $this->assertSame('Nota administrativa', $fixture['sale']->fresh()->notes);
+        try {
+            $fixture['item']->forceFill(['quantity' => 3])->save();
+            $this->fail('DatabaseTransactions must not grant construction permission.');
+        } catch (ValidationException) {
+            $this->assertSame(2.0, (float) $fixture['item']->fresh()->quantity);
+        }
+    }
+
+    public function test_foreign_loaded_sale_and_relation_cannot_be_written(): void
+    {
+        $foreign = $this->saleFixture();
+        $active = $this->businessFixture('Empresa activa F1');
+        $this->setTenant($active['business'], $active['user']);
+        foreach ([
+            fn () => $foreign['sale']->update(['notes' => 'Otra empresa']),
+            fn () => $foreign['sale']->items()->create(['product_id' => $foreign['product']->id, 'quantity' => 1, 'unit_price' => 100]),
+            fn () => app(SaleService::class)->create([
+                'business_id' => $foreign['business']->id,
+                'items' => [['product_id' => $foreign['product']->id, 'quantity' => 1, 'unit_price' => 100]],
+                'payment_method' => 'efectivo', 'amount_paid' => 118,
+            ]),
+        ] as $write) {
+            try {
+                $write();
+                $this->fail('A preloaded foreign model must not authorize writes.');
+            } catch (HttpException $exception) {
+                $this->assertSame(404, $exception->getStatusCode());
+            }
+        }
+    }
+
+    public function test_line_cannot_be_transferred_out_of_a_confirmed_sale(): void
+    {
+        $fixture = $this->saleFixture();
+        $destination = $fixture['sale']->replicate()->forceFill([
+            'sale_number' => 'F1-DESTINATION', 'number' => 'F1-DESTINATION',
+        ]);
+        app(SaleFinancialIntegrity::class)->construct($destination, function (Sale $destination) use ($fixture): void {
+            try {
+                $destination->items()->save($fixture['item']);
+                $this->fail('A writable new destination must not unlock its confirmed source.');
+            } catch (ValidationException) {
+                $this->assertSame($fixture['sale']->id, $fixture['item']->fresh()->sale_id);
+                $this->assertSame(0, $destination->items()->count());
+            }
+        });
+    }
+
+    public function test_relation_batch_rolls_back_all_lines_and_totals_if_a_product_is_foreign(): void
+    {
+        $fixture = $this->saleFixture();
+        $foreign = $this->businessFixture('Producto de otra empresa F1');
+        $foreignProduct = $this->productFor($foreign['business']);
+        $this->setTenant($fixture['business'], $fixture['user']);
+        $new = $fixture['sale']->replicate()->forceFill([
+            'sale_number' => 'F1-BATCH', 'number' => 'F1-BATCH',
+        ]);
+        app(SaleFinancialIntegrity::class)->construct($new, function (Sale $sale) use ($fixture, $foreignProduct): void {
+            $before = $sale->fresh()->getAttributes();
+            try {
+                $sale->items()->createMany([
+                    ['product_id' => $fixture['product']->id, 'quantity' => 1, 'unit_price' => 100],
+                    ['product_id' => $foreignProduct->id, 'quantity' => 1, 'unit_price' => 100],
+                ]);
+                $this->fail('Batch failure must not leave its first line or recalculated totals.');
+            } catch (HttpException $exception) {
+                $this->assertSame(404, $exception->getStatusCode());
+                $this->assertSame(0, $sale->items()->count());
+                $this->assertSame($before, $sale->fresh()->getAttributes());
+            }
+        });
+    }
+
+    public function test_new_lines_can_be_updated_and_transferred_only_during_their_construction(): void
+    {
+        $fixture = $this->saleFixture();
+        $source = $fixture['sale']->replicate()->forceFill([
+            'sale_number' => 'F1-MUTABLE', 'number' => 'F1-MUTABLE',
+            'subtotal' => 100, 'tax' => 18, 'total' => 118, 'amount_paid' => 118,
+        ]);
+        app(SaleFinancialIntegrity::class)->construct($source, function (Sale $sale) use ($fixture): void {
+            $sale->items()->create([
+                'product_id' => $fixture['product']->id, 'product_name' => 'Línea nueva F1',
+                'quantity' => 1, 'unit_price' => 100, 'unit_cost' => 30, 'subtotal' => 100, 'line_total' => 100,
+            ]);
+            $item = $sale->items()->sole();
+            $item->update(['quantity' => 2]);
+            $this->assertSame(236.0, (float) $sale->fresh()->total);
+            $target = $sale->replicate()->forceFill([
+                'sale_number' => 'F1-MUTABLE-TARGET', 'number' => 'F1-MUTABLE-TARGET',
+            ]);
+            app(SaleFinancialIntegrity::class)->construct($target, function (Sale $target) use ($sale, $item): void {
+                $target->items()->save($item);
+                $this->assertSame(0.0, (float) $sale->fresh()->total);
+                $this->assertSame(236.0, (float) $target->fresh()->total);
+                $this->assertSame($target->id, $item->fresh()->sale_id);
+            });
+        });
+        try {
+            $source->items()->create(['product_id' => $fixture['product']->id, 'quantity' => 1, 'unit_price' => 100]);
+            $this->fail('The construction permission must not survive its callback.');
+        } catch (ValidationException) {
+            $this->assertSame(0, $source->items()->count());
+        }
+    }
 
     public function test_partial_and_full_returns_reconcile_discount_tax_inventory_and_cash(): void
     {
@@ -183,8 +379,7 @@ class FinancialOperationsTest extends TestCase
 
     public function test_return_larger_than_amount_paid_is_rejected_before_inventory_or_cash_changes(): void
     {
-        $fixture = $this->saleFixture(discount: 20, openCashSession: true);
-        $fixture['sale']->forceFill(['amount_paid' => 100])->saveQuietly();
+        $fixture = $this->saleFixture(discount: 20, openCashSession: true, amountPaid: 100);
         $before = $this->returnState($fixture);
 
         try {
@@ -228,18 +423,8 @@ class FinancialOperationsTest extends TestCase
     {
         $fixture = $this->saleFixture(paymentMethod: PaymentMethod::Credito->value);
         $sale = $fixture['sale'];
-        $receivable = new Receivable;
-        $receivable->forceFill([
-            'id' => (string) Str::uuid(),
-            'business_id' => $fixture['business']->id,
-            'reference' => 'Venta '.$sale->sale_number,
-            'description' => 'Crédito de prueba',
-            'amount' => 236.0,
-            'paid_amount' => 0,
-            'balance' => 236.0,
-            'due_date' => now()->addDays(7)->toDateString(),
-            'status' => 'pendiente',
-        ])->saveQuietly();
+        $receivable = Receivable::withoutBusinessScope()->where('business_id', $sale->business_id)
+            ->where('sale_id', $sale->id)->sole();
 
         $result = app(SaleService::class)->returnFromAllocations(
             $sale,
@@ -381,6 +566,171 @@ class FinancialOperationsTest extends TestCase
             ->count());
     }
 
+    public function test_sale_accounting_uses_sale_business_when_another_filament_tenant_is_active(): void
+    {
+        $saleFixture = $this->saleFixture();
+        $otherTenant = $this->businessFixture('Tenant contable alterno');
+        AccountingService::createDefaultAccounts($saleFixture['business']);
+        AccountingService::createDefaultAccounts($otherTenant['business']);
+
+        $this->setTenant($otherTenant['business'], $otherTenant['user']);
+        filament()->setTenant($otherTenant['business']);
+
+        AccountingService::createFromSale($saleFixture['sale']);
+
+        $entry = JournalEntry::withoutBusinessScope()
+            ->where('reference', 'Venta #'.$saleFixture['sale']->sale_number)
+            ->firstOrFail();
+        $lineAccountBusinessIds = Account::withoutBusinessScope()
+            ->whereIn('id', JournalEntryLine::query()
+                ->where('journal_entry_id', $entry->id)
+                ->pluck('account_id'))
+            ->pluck('business_id')
+            ->unique()
+            ->all();
+
+        $this->assertSame($saleFixture['business']->id, $entry->business_id);
+        $this->assertSame([$saleFixture['business']->id], $lineAccountBusinessIds);
+        $this->assertSame($otherTenant['business']->id, app('currentBusinessId'));
+        $this->assertSame($otherTenant['business']->id, (string) filament()->getTenant()->getKey());
+    }
+
+    public function test_expense_accounting_uses_expense_business_when_another_filament_tenant_is_active(): void
+    {
+        $expenseFixture = $this->businessFixture('Negocio propietario del gasto');
+        $otherTenant = $this->businessFixture('Tenant activo del gasto');
+        AccountingService::createDefaultAccounts($expenseFixture['business']);
+        AccountingService::createDefaultAccounts($otherTenant['business']);
+
+        $expense = new Expense;
+        $expense->forceFill([
+            'id' => (string) Str::uuid(),
+            'business_id' => $expenseFixture['business']->id,
+            'category' => 'otros',
+            'description' => 'Gasto con tenant discordante',
+            'amount' => 25.50,
+            'payment_method' => 'efectivo',
+            'expense_date' => now()->toDateString(),
+            'is_paid' => true,
+        ])->saveQuietly();
+
+        $this->setTenant($otherTenant['business'], $otherTenant['user']);
+        filament()->setTenant($otherTenant['business']);
+
+        AccountingService::createFromExpense($expense);
+
+        $entry = JournalEntry::withoutBusinessScope()
+            ->where('reference', 'Gasto #'.$expense->id)
+            ->firstOrFail();
+        $lineAccountBusinessIds = Account::withoutBusinessScope()
+            ->whereIn('id', JournalEntryLine::query()
+                ->where('journal_entry_id', $entry->id)
+                ->pluck('account_id'))
+            ->pluck('business_id')
+            ->unique()
+            ->all();
+
+        $this->assertSame($expenseFixture['business']->id, $entry->business_id);
+        $this->assertSame([$expenseFixture['business']->id], $lineAccountBusinessIds);
+        $this->assertSame($otherTenant['business']->id, app('currentBusinessId'));
+        $this->assertSame($otherTenant['business']->id, (string) filament()->getTenant()->getKey());
+    }
+
+    public function test_journal_entry_lines_reject_accounts_from_another_business_without_partial_changes(): void
+    {
+        $entryFixture = $this->businessFixture('Negocio del asiento');
+        $accountFixture = $this->businessFixture('Negocio de la cuenta');
+        AccountingService::createDefaultAccounts($entryFixture['business']);
+        AccountingService::createDefaultAccounts($accountFixture['business']);
+        $entry = $this->draftEntry($entryFixture['business']);
+        $foreignAccount = Account::withoutBusinessScope()
+            ->where('business_id', $accountFixture['business']->id)
+            ->where('code', '1101')
+            ->firstOrFail();
+
+        try {
+            JournalEntryLine::create([
+                'journal_entry_id' => $entry->id,
+                'account_id' => $foreignAccount->id,
+                'debit' => 10,
+                'credit' => 0,
+            ]);
+            $this->fail('A journal entry must reject accounts owned by a different business.');
+        } catch (\RuntimeException $exception) {
+            $this->assertStringContainsString('mismo negocio', $exception->getMessage());
+        }
+
+        $this->assertSame(0, JournalEntryLine::query()
+            ->where('journal_entry_id', $entry->id)
+            ->count());
+        $this->assertSame(0.0, (float) $entry->fresh()->total_debit);
+        $this->assertSame(0.0, (float) $entry->fresh()->total_credit);
+    }
+
+    public function test_accounting_fails_closed_for_a_nonexistent_expense_tenant_without_creating_entries(): void
+    {
+        $entriesBefore = JournalEntry::withoutBusinessScope()->count();
+        $linesBefore = JournalEntryLine::query()->count();
+        $expense = new Expense;
+        $expense->forceFill([
+            'id' => (string) Str::uuid(),
+            'business_id' => (string) Str::uuid(),
+            'amount' => 25,
+            'payment_method' => 'efectivo',
+        ]);
+
+        try {
+            AccountingService::createFromExpense($expense);
+            $this->fail('Accounting must reject an expense whose tenant does not exist.');
+        } catch (\RuntimeException $exception) {
+            $this->assertStringContainsString('no existe', $exception->getMessage());
+        }
+
+        $this->assertSame($entriesBefore, JournalEntry::withoutBusinessScope()->count());
+        $this->assertSame($linesBefore, JournalEntryLine::query()->count());
+    }
+
+    public function test_business_creation_provisions_default_accounts(): void
+    {
+        $first = $this->businessFixture('Primer negocio');
+        app()->instance('currentBusinessId', $first['business']->id);
+        $second = $this->businessFixture('Segundo negocio');
+
+        $this->assertSame(14, Account::withoutBusinessScope()
+            ->where('business_id', $first['business']->id)
+            ->count());
+        $this->assertSame(14, Account::withoutBusinessScope()
+            ->where('business_id', $second['business']->id)
+            ->count());
+        $this->assertSame($first['business']->id, app('currentBusinessId'));
+    }
+
+    public function test_taxable_sale_does_not_leave_an_unbalanced_entry_when_tax_account_is_missing(): void
+    {
+        $fixture = $this->saleFixture();
+        AccountingService::createDefaultAccounts($fixture['business']);
+        Account::query()
+            ->where('business_id', $fixture['business']->id)
+            ->where('code', '2201')
+            ->firstOrFail()
+            ->delete();
+
+        try {
+            AccountingService::createFromSale($fixture['sale']);
+            $this->fail('A sale without its tax account must fail accounting explicitly.');
+        } catch (\RuntimeException $exception) {
+            $this->assertSame(
+                'Faltan cuentas obligatorias de cobro, ventas o ITBIS para generar el asiento.',
+                $exception->getMessage(),
+            );
+        }
+
+        $this->assertDatabaseMissing('journal_entries', [
+            'business_id' => $fixture['business']->id,
+            'reference' => 'Venta #'.$fixture['sale']->sale_number,
+        ]);
+    }
+
     public function test_journal_entry_publishing_requires_a_balanced_multi_line_entry(): void
     {
         $fixture = $this->saleFixture();
@@ -483,6 +833,7 @@ class FinancialOperationsTest extends TestCase
         string $paymentMethod = 'efectivo',
         bool $openCashSession = false,
         ?string $soldAt = null,
+        ?float $amountPaid = null,
     ): array {
         $tenant = $this->businessFixture('Operaciones financieras');
         $business = $tenant['business'];
@@ -496,6 +847,10 @@ class FinancialOperationsTest extends TestCase
         $total = round(($subtotal - $discount) * (1 + $taxRate / 100), 2);
         $now = $soldAt ? Carbon::parse($soldAt) : now();
         $sale = new Sale;
+        if (PaymentMethod::isCreditValue($paymentMethod)) {
+            config(['scale.post_sale_queue' => true]);
+            $sale->customer_id = Customer::create(['name' => 'Cliente crédito de prueba', 'is_active' => true])->id;
+        }
         $sale->forceFill([
             'id' => (string) Str::uuid(),
             'business_id' => $business->id,
@@ -507,16 +862,15 @@ class FinancialOperationsTest extends TestCase
             'tax' => round(($subtotal - $discount) * $taxRate / 100, 2),
             'total' => $total,
             'payment_method' => $paymentMethod,
-            'amount_paid' => PaymentMethod::isCreditValue($paymentMethod) ? 0 : $total,
+            'amount_paid' => $amountPaid ?? (PaymentMethod::isCreditValue($paymentMethod) ? 0 : $total),
             'status' => SaleStatus::Completada->value,
             'created_by' => $user->id,
             'user_id' => $user->id,
             'sale_date' => $now,
             'sold_at' => $now,
-        ])->saveQuietly();
+        ]);
 
-        $item = new SaleItem;
-        $item->forceFill([
+        $item = $this->persistFixtureLine($sale, [
             'id' => (string) Str::uuid(),
             'business_id' => $business->id,
             'sale_id' => $sale->id,
@@ -528,7 +882,7 @@ class FinancialOperationsTest extends TestCase
             'unit_cost' => 30,
             'subtotal' => $subtotal,
             'line_total' => $subtotal,
-        ])->saveQuietly();
+        ]);
 
         $batch = new ProductBatch;
         $batch->forceFill([
@@ -636,10 +990,9 @@ class FinancialOperationsTest extends TestCase
             'status' => SaleStatus::Completada->value,
             'sale_date' => Carbon::parse($date),
             'sold_at' => Carbon::parse($date),
-        ])->saveQuietly();
+        ]);
 
-        $item = new SaleItem;
-        $item->forceFill([
+        $this->persistFixtureLine($sale, [
             'id' => (string) Str::uuid(),
             'business_id' => $business->id,
             'sale_id' => $sale->id,
@@ -650,9 +1003,21 @@ class FinancialOperationsTest extends TestCase
             'unit_cost' => $cost,
             'subtotal' => $subtotal,
             'line_total' => $subtotal,
-        ])->saveQuietly();
+        ]);
 
         return $sale;
+    }
+
+    private function persistFixtureLine(Sale $sale, array $attributes): SaleItem
+    {
+        return TenantContext::run((string) $sale->business_id, fn () => Sale::withoutEvents(
+            fn () => app(SaleFinancialIntegrity::class)->construct($sale, function (Sale $sale) use ($attributes): SaleItem {
+                $item = new SaleItem;
+                $item->forceFill(array_replace($attributes, ['sale_id' => $sale->id]))->saveQuietly();
+
+                return $item;
+            }),
+        ));
     }
 
     private function setTenant(Business $business, User $user): void

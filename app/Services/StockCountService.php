@@ -3,13 +3,17 @@
 namespace App\Services;
 
 use App\Enums\InventoryMovementType;
+use App\Models\Branch;
+use App\Models\Business;
 use App\Models\InventoryMovement;
 use App\Models\Product;
 use App\Models\ProductBatch;
 use App\Models\StockCount;
 use App\Models\StockCountItem;
+use App\Models\User;
+use App\Scopes\BranchScope;
 use Carbon\Carbon;
-use Exception;
+use Illuminate\Auth\Access\AuthorizationException;
 use Illuminate\Support\Facades\DB;
 use InvalidArgumentException;
 use RuntimeException;
@@ -33,6 +37,7 @@ class StockCountService
      */
     public function open(string $businessId, array $params = []): StockCount
     {
+        $branchId = $this->resolveAuthorizedBranch($businessId);
         $scope = $params['scope'] ?? StockCount::SCOPE_FULL;
         $filters = $params['scope_filters'] ?? [];
         $productIds = $params['product_ids'] ?? ($filters['product_ids'] ?? []);
@@ -46,7 +51,7 @@ class StockCountService
             throw new InvalidArgumentException('Alcance de conteo inválido.');
         }
 
-        return DB::transaction(function () use ($businessId, $scope, $filters, $productIds, $categoryIds, $params): StockCount {
+        return DB::transaction(function () use ($businessId, $branchId, $scope, $filters, $productIds, $categoryIds, $params): StockCount {
             $count = new StockCount([
                 'code' => $params['code'] ?? $this->generateCode($businessId),
                 'status' => StockCount::STATUS_DRAFT,
@@ -57,11 +62,17 @@ class StockCountService
                 'notes' => $params['notes'] ?? null,
             ]);
             $count->business_id = $businessId;
+            $count->branch_id = $branchId;
             $count->save();
 
             $productsQuery = Product::withoutBusinessScope()
                 ->where('business_id', $businessId)
                 ->where('is_active', true);
+
+            $productsQuery->where(function ($query) use ($branchId): void {
+                $query->where('branch_id', $branchId)
+                    ->orWhereNull('branch_id');
+            });
 
             if ($scope === StockCount::SCOPE_CATEGORY && $categoryIds) {
                 $productsQuery->whereIn('category_id', $categoryIds);
@@ -74,7 +85,9 @@ class StockCountService
                 foreach ($products as $product) {
                     /** @var Product $product */
                     $batches = ProductBatch::withoutBusinessScope()
+                        ->where('business_id', $count->business_id)
                         ->where('product_id', $product->id)
+                        ->where('branch_id', $count->branch_id)
                         ->whereNull('deleted_at')
                         ->get();
 
@@ -88,10 +101,15 @@ class StockCountService
                                 'unit_cost' => (float) ($batch->cost ?: $product->cost),
                             ]);
                             $item->business_id = $count->business_id;
+                            $item->branch_id = $count->branch_id;
                             $item->save();
                             $totalItems++;
                         }
                     } else {
+                        if (! $this->canCountUnbatchedStock($product, $count->branch_id)) {
+                            continue;
+                        }
+
                         $item = new StockCountItem([
                             'stock_count_id' => $count->id,
                             'product_id' => $product->id,
@@ -100,6 +118,7 @@ class StockCountService
                             'unit_cost' => (float) $product->cost,
                         ]);
                         $item->business_id = $count->business_id;
+                        $item->branch_id = $count->branch_id;
                         $item->save();
                         $totalItems++;
                     }
@@ -119,15 +138,20 @@ class StockCountService
      */
     public function saveCount(StockCount $count, array $countedByItemId): StockCount
     {
-        if (! $count->isEditable()) {
-            throw new RuntimeException('El conteo ya fue cerrado.');
-        }
+        return DB::transaction(function () use ($count, $countedByItemId): StockCount {
+            $count = $this->lockAuthorizedCount($count);
 
-        DB::transaction(function () use ($count, $countedByItemId): void {
+            if (! $count->isEditable()) {
+                throw new RuntimeException('El conteo ya fue cerrado.');
+            }
+
             foreach ($countedByItemId as $itemId => $counted) {
                 $item = StockCountItem::withoutBusinessScope()
                     ->where('stock_count_id', $count->id)
+                    ->where('business_id', $count->business_id)
+                    ->where('branch_id', $count->branch_id)
                     ->whereKey((string) $itemId)
+                    ->lockForUpdate()
                     ->first();
                 if (! $item) {
                     continue;
@@ -141,9 +165,9 @@ class StockCountService
                     'cost_impact' => round($diff * (float) $item->unit_cost, 2),
                 ])->save();
             }
-        });
 
-        return $count->fresh(['items']);
+            return $count->fresh(['items']);
+        });
     }
 
     /**
@@ -152,14 +176,21 @@ class StockCountService
      */
     public function complete(StockCount $count, ?string $userId = null): StockCount
     {
-        if ($count->status !== StockCount::STATUS_IN_PROGRESS && $count->status !== StockCount::STATUS_DRAFT) {
-            throw new RuntimeException('Solo se pueden completar conteos en borrador o en captura.');
-        }
-
         return DB::transaction(function () use ($count, $userId): StockCount {
+            $count = $this->lockAuthorizedCount($count);
+
+            if (! $count->isEditable()) {
+                throw new RuntimeException('Solo se pueden completar conteos en borrador o en captura.');
+            }
+
             $items = StockCountItem::withoutBusinessScope()
                 ->where('stock_count_id', $count->id)
+                ->where('business_id', $count->business_id)
+                ->where('branch_id', $count->branch_id)
                 ->whereNotNull('counted_quantity')
+                ->orderBy('product_id')
+                ->orderBy('batch_id')
+                ->lockForUpdate()
                 ->get();
 
             $itemsWithDiff = 0;
@@ -179,18 +210,34 @@ class StockCountService
 
                 /** @var Product $product */
                 $product = Product::withoutBusinessScope()
+                    ->where('business_id', $count->business_id)
+                    ->where(function ($query) use ($count): void {
+                        $query->where('branch_id', $count->branch_id)
+                            ->orWhereNull('branch_id');
+                    })
                     ->whereKey($item->product_id)
                     ->lockForUpdate()
-                    ->firstOrFail();
+                    ->first();
+
+                if (! $product) {
+                    throw new RuntimeException('El producto no pertenece al negocio y sucursal del conteo.');
+                }
+
+                if (! $item->batch_id && ! $this->canCountUnbatchedStock($product, $count->branch_id)) {
+                    throw new RuntimeException('No se puede ajustar stock sin lote sin un saldo verificable para el conteo. Abra un nuevo conteo.');
+                }
 
                 $batch = null;
                 if ($item->batch_id) {
                     $batch = ProductBatch::withoutBusinessScope()
+                        ->where('business_id', $count->business_id)
+                        ->where('branch_id', $count->branch_id)
+                        ->where('product_id', $product->id)
                         ->whereKey($item->batch_id)
                         ->lockForUpdate()
                         ->first();
                     if (! $batch) {
-                        throw new Exception("El lote {$item->batch_id} ya no existe; no se puede ajustar.");
+                        throw new RuntimeException("El lote {$item->batch_id} no existe o no pertenece a la sucursal del conteo.");
                     }
                     $newBatchQty = round((float) $batch->quantity + ($type->stockSign() * $qty), 3);
                     if ($newBatchQty < 0) {
@@ -216,6 +263,7 @@ class StockCountService
                     'created_by' => $userId ?? auth()->id(),
                 ]);
                 $movement->business_id = $count->business_id;
+                $movement->branch_id = $count->branch_id;
                 if ($batch) {
                     $movement->batch_id = $batch->id;
                 }
@@ -250,22 +298,27 @@ class StockCountService
 
     public function cancel(StockCount $count, ?string $userId = null): StockCount
     {
-        if ($count->status === StockCount::STATUS_COMPLETED) {
-            throw new RuntimeException('No se puede cancelar un conteo ya aplicado.');
-        }
-        $count->forceFill([
-            'status' => StockCount::STATUS_CANCELLED,
-            'cancelled_at' => now(),
-            'closed_by' => $userId ?? auth()->id(),
-        ])->save();
+        return DB::transaction(function () use ($count, $userId): StockCount {
+            $count = $this->lockAuthorizedCount($count);
 
-        return $count;
+            if ($count->status === StockCount::STATUS_COMPLETED) {
+                throw new RuntimeException('No se puede cancelar un conteo ya aplicado.');
+            }
+            $count->forceFill([
+                'status' => StockCount::STATUS_CANCELLED,
+                'cancelled_at' => now(),
+                'closed_by' => $userId ?? auth()->id(),
+            ])->save();
+
+            return $count;
+        });
     }
 
     protected function generateCode(string $businessId): string
     {
         $prefix = 'CC-'.Carbon::now()->format('Ymd');
         $last = StockCount::withoutBusinessScope()
+            ->withoutGlobalScope(BranchScope::class)
             ->where('business_id', $businessId)
             ->where('code', 'like', "$prefix-%")
             ->orderByDesc('code')
@@ -273,5 +326,63 @@ class StockCountService
         $seq = $last ? ((int) substr($last, -4)) + 1 : 1;
 
         return $prefix.'-'.str_pad((string) $seq, 4, '0', STR_PAD_LEFT);
+    }
+
+    private function canCountUnbatchedStock(Product $product, string $branchId): bool
+    {
+        return (string) $product->branch_id === $branchId
+            && ! ProductBatch::withoutBusinessScope()
+                ->withoutGlobalScope(BranchScope::class)
+                ->where('business_id', $product->business_id)
+                ->where('product_id', $product->id)
+                ->exists();
+    }
+
+    private function resolveAuthorizedBranch(string $businessId): string
+    {
+        $user = auth()->user();
+        if (! $user instanceof User) {
+            throw new AuthorizationException('Se requiere un usuario autenticado para operar conteos.');
+        }
+
+        abort_unless(
+            (string) session(AuthContextResolver::SESSION_BUSINESS_ID) === $businessId,
+            404,
+        );
+
+        $user = User::query()->whereKey($user->getKey())->where('is_active', true)->first();
+        if (! $user || ! Business::query()->whereKey($businessId)->where('is_active', true)->exists()) {
+            throw new AuthorizationException('El usuario y el negocio deben estar activos.');
+        }
+
+        $context = app(BranchAccessContext::class);
+        $context->forget($businessId);
+        $branchId = $context->resolveFor($user, $businessId)->effectiveBranchId();
+
+        if ($branchId === null || ! Branch::withoutBusinessScope()
+            ->where('business_id', $businessId)
+            ->where('is_active', true)
+            ->whereKey($branchId)
+            ->exists()) {
+            throw new AuthorizationException('Seleccione una sucursal activa del negocio para operar conteos.');
+        }
+
+        return $branchId;
+    }
+
+    private function lockAuthorizedCount(StockCount $count): StockCount
+    {
+        $businessId = (string) session(AuthContextResolver::SESSION_BUSINESS_ID);
+        $branchId = $this->resolveAuthorizedBranch($businessId);
+        $locked = StockCount::withoutBusinessScope()
+            ->where('business_id', $businessId)
+            ->where('branch_id', $branchId)
+            ->whereKey($count->getKey())
+            ->lockForUpdate()
+            ->first();
+
+        abort_unless($locked instanceof StockCount, 404);
+
+        return $locked;
     }
 }

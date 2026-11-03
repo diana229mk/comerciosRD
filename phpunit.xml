@@ -25,7 +25,7 @@
         <env name="BROADCAST_CONNECTION" value="null"/>
         <env name="CACHE_STORE" value="array"/>
         <env name="DB_CONNECTION" value="mysql" force="true"/>
-        <env name="DB_HOST" value="127.0.0.1" force="true"/>
+        <env name="DB_HOST" value="127.0.0.1" force="false"/>
         <env name="DB_DATABASE" value="comercios_rd_storage_test" force="true"/>
         <env name="DB_URL" value="" force="true"/>
         <env name="MAIL_MAILER" value="array"/>

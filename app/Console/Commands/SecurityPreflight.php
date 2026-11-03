@@ -2,6 +2,7 @@
 
 namespace App\Console\Commands;
 
+use App\Services\MysqlTlsPolicy;
 use Illuminate\Console\Command;
 
 /**
@@ -30,12 +31,37 @@ class SecurityPreflight extends Command
         $violations = [];
         $warnings = [];
 
+        if (config('database.default') === 'mysql') {
+            try {
+                MysqlTlsPolicy::pdoOptions((array) config('database.connections.mysql'));
+            } catch (\RuntimeException $exception) {
+                $violations[] = $exception->getMessage();
+            }
+        }
+
         if (config('ecf.enabled') && ! config('ecf.validation_approved')) {
             $violations[] = 'ECF_ENABLED=true no habilita e-CF: falta aprobación de validación XAdES/DGII en el código.';
         }
 
         if (blank(config('app.key'))) {
             $violations[] = 'APP_KEY está vacía. Genera una con `php artisan key:generate` y ¡NO la rotes después!';
+        }
+
+        if ($isProd && ! config('security.two_factor.enabled')) {
+            $violations[] = 'SECURITY_2FA_ENABLED=false. La autenticación de dos factores debe estar activa en producción.';
+        }
+
+        if ($isProd) {
+            $requiredRoles = (array) config('security.two_factor.required_roles', []);
+            foreach (['owner', 'admin'] as $role) {
+                if (! in_array($role, $requiredRoles, true)) {
+                    $violations[] = "El rol {$role} no tiene 2FA obligatorio en producción.";
+                }
+            }
+
+            if (! config('security.two_factor.require_master', false)) {
+                $violations[] = 'SECURITY_2FA_REQUIRE_MASTER debe estar activo en producción.';
+            }
         }
 
         if ($isProd && config('app.debug')) {
@@ -109,7 +135,14 @@ class SecurityPreflight extends Command
         }
 
         if ($isProd && ! config('portability.backup_enabled')) {
-            $warnings[] = 'PORTABILITY_BACKUP_ENABLED=false. Sin backup diario no hay cutover de proveedor sin riesgo de pérdida.';
+            $violations[] = 'PORTABILITY_BACKUP_ENABLED=false. Debe existir una ruta de backup operativa antes de producción.';
+        }
+
+        if ($isProd && (
+            config('filesystems.default') === 's3'
+            || config('filesystems.disks.private.driver', 'local') === 's3'
+        )) {
+            $violations[] = 'El backup portability local no incluye buckets S3/Spaces; verifica una estrategia externa de respaldo y restauración de objetos antes del deploy.';
         }
 
         foreach ($warnings as $w) {

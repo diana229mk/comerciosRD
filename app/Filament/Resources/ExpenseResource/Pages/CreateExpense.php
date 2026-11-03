@@ -4,6 +4,8 @@ namespace App\Filament\Resources\ExpenseResource\Pages;
 
 use App\Filament\Resources\ExpenseResource;
 use Filament\Resources\Pages\CreateRecord;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Facades\DB;
 
 class CreateExpense extends CreateRecord
 {
@@ -17,6 +19,11 @@ class CreateExpense extends CreateRecord
         $data['is_paid'] = $data['is_paid'] ?? true;
 
         return $data;
+    }
+
+    protected function handleRecordCreation(array $data): Model
+    {
+        return DB::transaction(fn (): Model => parent::handleRecordCreation($data));
     }
 
     protected function getRedirectUrl(): string

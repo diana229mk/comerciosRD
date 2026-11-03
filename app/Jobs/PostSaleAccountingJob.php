@@ -4,7 +4,7 @@ namespace App\Jobs;
 
 use App\Jobs\Concerns\AppliesTenantContext;
 use App\Models\Sale;
-use App\Services\AccountingService;
+use App\Services\AccountingOutboxService;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
@@ -13,7 +13,7 @@ use Illuminate\Queue\SerializesModels;
 
 /**
  * Asiento contable fuera del request del cajero.
- * Idempotente: AccountingService no duplica por reference.
+ * La identidad durable es empresa/venta; el asiento y su confirmación son atómicos.
  */
 class PostSaleAccountingJob implements ShouldQueue
 {
@@ -37,12 +37,11 @@ class PostSaleAccountingJob implements ShouldQueue
     public static function dispatchFor(Sale $sale): void
     {
         $job = new self((string) $sale->business_id, (string) $sale->id);
+        $outbox = app(AccountingOutboxService::class);
+        $event = $outbox->register($sale);
 
         if (config('scale.post_sale_queue')) {
-            $pending = dispatch($job);
-            if (! app()->runningUnitTests()) {
-                $pending->afterCommit();
-            }
+            $outbox->dispatchAfterCommit($event);
 
             return;
         }
@@ -62,7 +61,7 @@ class PostSaleAccountingJob implements ShouldQueue
                 return;
             }
 
-            AccountingService::createFromSale($sale);
+            app(AccountingOutboxService::class)->process($sale);
         });
     }
 }

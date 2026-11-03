@@ -45,12 +45,14 @@ class PortabilityCheck extends Command
         $this->line('  FILESYSTEM_DISK='.$disk);
         if ($disk === 's3') {
             $this->warn('  S3 activo: el cutover debe copiar el bucket además del dump.');
+            $ok = false;
         }
 
         $privateDisk = (string) config('filesystems.disks.private.driver', 'local');
         $this->line('  PRIVATE_FILESYSTEM_DRIVER='.$privateDisk);
         if ($privateDisk === 's3') {
             $this->warn('  El backup local portability:backup no incluye el bucket del disco privado; configura y prueba respaldos/versionado externos de Spaces.');
+            $ok = false;
         }
 
         $backupDir = (string) config('portability.backup_dir');

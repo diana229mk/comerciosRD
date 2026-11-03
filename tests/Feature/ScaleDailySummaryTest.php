@@ -5,11 +5,12 @@ namespace Tests\Feature;
 use App\Contracts\RecordsSale;
 use App\Enums\BusinessType;
 use App\Jobs\IssueElectronicInvoiceJob;
-use App\Jobs\PostSaleAccountingJob;
+use App\Models\AccountingOutbox;
 use App\Models\Business;
 use App\Models\Product;
 use App\Models\SalesDaily;
 use App\Models\User;
+use App\Services\SaleService;
 use App\Support\TenantContext;
 use Illuminate\Foundation\Testing\DatabaseTransactions;
 use Illuminate\Support\Facades\Bus;
@@ -92,7 +93,7 @@ class ScaleDailySummaryTest extends TestCase
             ]],
         ]);
 
-        app(\App\Services\SaleService::class)->cancel($sale);
+        app(SaleService::class)->cancel($sale);
 
         $row = SalesDaily::withoutBusinessScope()
             ->where('business_id', $business->id)
@@ -139,14 +140,13 @@ class ScaleDailySummaryTest extends TestCase
         );
     }
 
-    public function test_post_sale_jobs_are_dispatched_when_queue_enabled(): void
+    public function test_post_sale_accounting_is_registered_durably_when_queue_enabled(): void
     {
         config([
             'scale.post_sale_queue' => true,
-            'ecf.enabled' => true,
-            'ecf.validation_approved' => true,
+            'ecf.enabled' => false,
         ]);
-        Bus::fake([PostSaleAccountingJob::class, IssueElectronicInvoiceJob::class]);
+        Bus::fake([IssueElectronicInvoiceJob::class]);
 
         ['user' => $user, 'business' => $business, 'product' => $product] = $this->seedSaleContext();
 
@@ -162,11 +162,11 @@ class ScaleDailySummaryTest extends TestCase
             ]],
         ]);
 
-        Bus::assertDispatched(PostSaleAccountingJob::class, function (PostSaleAccountingJob $job) use ($sale): bool {
-            return $job->saleId === (string) $sale->id
-                && $job->businessId === (string) $sale->business_id;
-        });
-        Bus::assertDispatched(IssueElectronicInvoiceJob::class);
+        $event = AccountingOutbox::withoutBusinessScope()
+            ->where('business_id', $sale->business_id)->where('sale_id', $sale->id)->sole();
+        $this->assertSame('pending', $event->status);
+        $this->assertNull($event->journal_entry_id);
+        Bus::assertNotDispatched(IssueElectronicInvoiceJob::class);
     }
 
     public function test_tenant_context_restores_previous_binding(): void

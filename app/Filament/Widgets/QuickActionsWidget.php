@@ -140,16 +140,18 @@ class QuickActionsWidget extends Widget
 
     public function createExpense(array $data): void
     {
-        Expense::create([
-            'user_id' => auth()->id(),
-            'created_by' => auth()->id(),
-            'category' => $data['category'],
-            'description' => $data['description'],
-            'amount' => $data['amount'],
-            'payment_method' => $data['payment_method'] ?? PaymentMethod::Cash->value,
-            'expense_date' => $data['expense_date'] ?? now()->toDateString(),
-            'is_paid' => true,
-        ]);
+        DB::transaction(function () use ($data): void {
+            Expense::create([
+                'user_id' => auth()->id(),
+                'created_by' => auth()->id(),
+                'category' => $data['category'],
+                'description' => $data['description'],
+                'amount' => $data['amount'],
+                'payment_method' => $data['payment_method'] ?? PaymentMethod::Cash->value,
+                'expense_date' => $data['expense_date'] ?? now()->toDateString(),
+                'is_paid' => true,
+            ]);
+        });
 
         Notification::make()
             ->title('Gasto registrado')

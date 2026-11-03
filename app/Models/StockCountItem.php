@@ -3,6 +3,7 @@
 namespace App\Models;
 
 use App\Traits\BelongsToBusiness;
+use App\Traits\ScopedByBranch;
 use App\Traits\TracksBranch;
 use Illuminate\Database\Eloquent\Concerns\HasUuids;
 use Illuminate\Database\Eloquent\Model;
@@ -12,6 +13,7 @@ class StockCountItem extends Model
 {
     use BelongsToBusiness;
     use HasUuids;
+    use ScopedByBranch;
     use TracksBranch;
 
     protected $fillable = [

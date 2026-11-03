@@ -2,6 +2,7 @@
 
 use Illuminate\Foundation\Inspiring;
 use Illuminate\Support\Facades\Artisan;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schedule;
 
 Artisan::command('inspire', function () {
@@ -20,7 +21,7 @@ Schedule::command('session:prune')
 // P2.3: limpiar tabla `login_attempts` de intentos viejos (>7 días) para
 // mantener la escalera de bloqueo relevante y evitar crecimiento sin fin.
 Schedule::call(function (): void {
-    \Illuminate\Support\Facades\DB::table('login_attempts')
+    DB::table('login_attempts')
         ->where('attempted_at', '<', now()->subDays(7))
         ->delete();
 })->daily()->name('prune-login-attempts')->onOneServer();
@@ -36,7 +37,12 @@ Schedule::command('sales:rebuild-daily')
     ->onOneServer()
     ->withoutOverlapping();
 
-// Red de seguridad si la cola `sales` perdió un asiento/e-CF.
+// Los leases SQL permiten concurrencia sin depender de locks en Redis.
+Schedule::command('accounting:outbox-dispatch')
+    ->everyMinute()
+    ->when(fn () => (bool) config('scale.post_sale_queue'));
+
+// Compatibilidad de efectos heredados; no es la recuperación durable del outbox.
 Schedule::command('sales:reconcile-side-effects --hours=24')
     ->hourly()
     ->onOneServer()

@@ -53,7 +53,8 @@ class PdoMysqlServerIdentityReader implements MysqlServerIdentityReader
             $pdo = new PDO($dsn, $connection['username'], $connection['password'], [
                 PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
                 PDO::ATTR_TIMEOUT => 5,
-            ]);
+            ] + MysqlTlsPolicy::pdoOptions($connection));
+            MysqlTlsPolicy::assertEncrypted($pdo, $connection);
             $identity = $pdo->query(
                 'SELECT @@server_uuid AS server_uuid, @@port AS server_port, @@socket AS server_socket'
             )->fetch(PDO::FETCH_ASSOC);

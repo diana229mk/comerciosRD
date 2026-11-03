@@ -13,6 +13,9 @@ use RuntimeException;
  */
 final class TenantContext
 {
+    // Scoped override for trusted operations targeting a verified business.
+    public const EXPLICIT_BUSINESS_ID = 'explicitBusinessId';
+
     public static function apply(string $businessId): Business
     {
         $business = Business::query()->find($businessId);
@@ -36,9 +39,14 @@ final class TenantContext
     {
         $previousId = app()->bound('currentBusinessId') ? app('currentBusinessId') : null;
         $previous = app()->bound('currentBusiness') ? app('currentBusiness') : null;
+        $hadExplicitBusinessId = app()->bound(self::EXPLICIT_BUSINESS_ID);
+        $previousExplicitBusinessId = $hadExplicitBusinessId
+            ? app(self::EXPLICIT_BUSINESS_ID)
+            : null;
 
         try {
             $business = self::apply($businessId);
+            app()->instance(self::EXPLICIT_BUSINESS_ID, (string) $business->getKey());
 
             return $callback($business);
         } finally {
@@ -52,6 +60,12 @@ final class TenantContext
                 app()->instance('currentBusiness', $previous);
             } else {
                 app()->forgetInstance('currentBusiness');
+            }
+
+            if ($hadExplicitBusinessId) {
+                app()->instance(self::EXPLICIT_BUSINESS_ID, $previousExplicitBusinessId);
+            } else {
+                app()->forgetInstance(self::EXPLICIT_BUSINESS_ID);
             }
         }
     }

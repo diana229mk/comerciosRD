@@ -6,6 +6,7 @@ use App\Models\Business;
 use App\Scopes\BusinessScope;
 use App\Services\AuditLogger;
 use App\Services\SecurityAlertService;
+use App\Support\TenantContext;
 use Filament\Facades\Filament;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
@@ -82,10 +83,18 @@ trait BelongsToBusiness
     /**
      * Obtiene el Business actual (tenant) de forma segura.
      *
-     * Orden: Filament tenant → container → session → user.currentBusiness
+     * Orden: contexto explícito verificado → Filament → container → sesión → usuario
      */
     public static function getCurrentBusiness(): ?Business
     {
+        $explicitBusinessId = app()->bound(TenantContext::EXPLICIT_BUSINESS_ID)
+            ? app(TenantContext::EXPLICIT_BUSINESS_ID)
+            : null;
+
+        if ($explicitBusinessId !== null && $explicitBusinessId !== '') {
+            return Business::query()->find((string) $explicitBusinessId);
+        }
+
         // 1) Filament tenant activo
         if (class_exists(Filament::class)) {
             try {
@@ -129,6 +138,13 @@ trait BelongsToBusiness
      */
     public static function resolveCurrentBusinessId(): ?string
     {
+        if (app()->bound(TenantContext::EXPLICIT_BUSINESS_ID)) {
+            $explicitBusinessId = app(TenantContext::EXPLICIT_BUSINESS_ID);
+            if ($explicitBusinessId !== null && $explicitBusinessId !== '') {
+                return (string) $explicitBusinessId;
+            }
+        }
+
         if (class_exists(Filament::class)) {
             try {
                 $tenant = Filament::getTenant();

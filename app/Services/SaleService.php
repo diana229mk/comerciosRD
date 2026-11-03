@@ -49,52 +49,83 @@ class SaleService implements RecordsSale
      */
     public function convertFromOrder(Order $order, array $overrides = []): Sale
     {
-        $order->loadMissing('items');
+        $businessId = (string) $order->business_id;
+        app(SaleFinancialIntegrity::class)->assertBusiness($businessId);
 
-        if ($order->items->isEmpty()) {
-            throw new InvalidArgumentException('La cotización/orden no tiene productos para convertir.');
-        }
+        return app(SaleCheckout::class)->run($businessId, 'order:'.$order->id,
+            ['entry' => 'order', 'id' => $order->id, 'overrides' => $overrides], function () use ($order, $overrides, $businessId): Sale {
+                $order = Order::withoutBusinessScope()->where('business_id', $businessId)
+                    ->whereKey($order->id)->lockForUpdate()->firstOrFail();
+                if ($order->converted_sale_id) {
+                    throw new InvalidArgumentException('La orden ya tiene una venta; no se convertirá de nuevo.');
+                }
+                if (isset($overrides['business_id']) && (string) $overrides['business_id'] !== $businessId) {
+                    abort(404);
+                }
+                $order->loadMissing('items');
 
-        $items = $order->items->map(fn ($item) => [
-            'product_id' => $item->product_id,
-            'product_name' => $item->product_name,
-            'quantity' => (float) ($item->quantity ?? 1),
-            'unit_price' => (float) ($item->unit_price ?? 0),
-            'unit_code' => $item->unit,
-            'variant_id' => null,
-        ])->all();
+                if ($order->items->isEmpty()) {
+                    throw new InvalidArgumentException('La cotización/orden no tiene productos para convertir.');
+                }
 
-        $payload = array_merge([
-            'business_id' => $order->business_id,
-            'customer_id' => $order->customer_id,
-            'customer_name' => $order->customer_name,
-            'notes' => 'Convertida desde cotización '.($order->quote_number ?: $order->order_number),
-            'payment_method' => PaymentMethod::Efectivo->value,
-            'amount_paid' => (float) ($order->total ?? 0),
-            'items' => $items,
-        ], $overrides);
+                $items = $order->items->map(fn ($item) => [
+                    'product_id' => $item->product_id,
+                    'product_name' => $item->product_name,
+                    'quantity' => (float) ($item->quantity ?? 1),
+                    'unit_price' => (float) ($item->unit_price ?? 0),
+                    'unit_code' => $item->unit,
+                    'variant_id' => null,
+                ])->all();
 
-        if ($order->kitchen_issued_at) {
-            $payload['skip_inventory'] = true;
-        }
+                $payload = array_merge([
+                    'business_id' => $order->business_id,
+                    'customer_id' => $order->customer_id,
+                    'customer_name' => $order->customer_name,
+                    'notes' => 'Convertida desde cotización '.($order->quote_number ?: $order->order_number),
+                    'payment_method' => PaymentMethod::Efectivo->value,
+                    'amount_paid' => (float) ($order->total ?? 0),
+                    'items' => $items,
+                ], $overrides);
 
-        $sale = $this->create($payload);
+                if ($order->kitchen_issued_at) {
+                    $payload['skip_inventory'] = true;
+                }
 
-        $isCafeteria = $order->business?->isCafeteria()
-            ?? Business::query()->find($order->business_id)?->isCafeteria();
+                $sale = $this->create($payload);
 
-        $order->update([
-            'status' => $isCafeteria ? 'completada' : 'converted',
-            'converted_sale_id' => $sale->id,
-            'completed_at' => $isCafeteria ? now() : $order->completed_at,
-        ]);
+                $isCafeteria = $order->business?->isCafeteria()
+                    ?? Business::query()->find($order->business_id)?->isCafeteria();
 
-        return $sale;
+                if (! $order->update([
+                    'status' => $isCafeteria ? 'completada' : 'converted',
+                    'converted_sale_id' => $sale->id,
+                    'completed_at' => $isCafeteria ? now() : $order->completed_at,
+                ])) {
+                    throw new RuntimeException('No se pudo confirmar la conversión de la orden.');
+                }
+
+                return $sale;
+            });
     }
 
     public function create(array $data): Sale
     {
         return ScaleMetrics::time('checkout.create', function () use ($data): Sale {
+            $businessId = (string) ($data['business_id'] ?? '');
+            app(SaleFinancialIntegrity::class)->assertBusiness($businessId);
+            $checkout = app(SaleCheckout::class);
+            if (! $checkout->isActive($businessId) && isset($data['idempotency_key'])) {
+                $command = $data;
+                unset($command['idempotency_key']);
+                $command['payment_method'] = PaymentMethod::normalize($data['payment_method'] ?? null)->value;
+
+                return $checkout->run($businessId, (string) $data['idempotency_key'],
+                    ['entry' => 'sale-service', 'data' => $command], fn () => $this->createSale($data));
+            }
+            if (PaymentMethod::isCreditValue($data['payment_method'] ?? null) && ! $checkout->isActive($businessId)) {
+                throw new InvalidArgumentException('La venta a crédito requiere una clave de solicitud estable.');
+            }
+
             return $this->createSale($data);
         }, ['business_id' => (string) ($data['business_id'] ?? '')]);
     }
@@ -104,7 +135,8 @@ class SaleService implements RecordsSale
      */
     protected function createSale(array $data): Sale
     {
-        $businessId = (string) $data['business_id'];
+        $businessId = (string) ($data['business_id'] ?? '');
+        app(SaleFinancialIntegrity::class)->assertBusiness($businessId);
         $itemsInput = $data['items'] ?? [];
 
         if ($itemsInput === []) {
@@ -114,6 +146,14 @@ class SaleService implements RecordsSale
         $sale = DB::transaction(function () use ($data, $businessId, $itemsInput): Sale {
             $lines = [];
             $subtotal = 0.0;
+            if (PaymentMethod::isCreditValue($data['payment_method'] ?? null)) {
+                $probe = new Sale;
+                $probe->forceFill([
+                    'business_id' => $businessId, 'customer_id' => $data['customer_id'] ?? null,
+                    'payment_method' => PaymentMethod::Credito, 'amount_paid' => '0.00',
+                ]);
+                app(SaleCreditService::class)->prepare($probe);
+            }
 
             $business = Business::query()->find($businessId);
             $isPharmacy = $business?->isPharmacy() ?? false;
@@ -415,62 +455,65 @@ class SaleService implements RecordsSale
                 'sold_at' => now(),
             ]);
             $sale->business_id = $businessId;
-            $sale->save();
 
-            $refToItemId = []; // mapea parent_sale_item_ref -> saleItem->id
-            foreach ($lines as $idx => $line) {
-                /** @var Product $product */
-                $product = $line['product'];
+            return app(SaleFinancialIntegrity::class)->construct($sale, function (Sale $sale) use ($lines, $businessId, $rxQtyPending, $rxItemsCache, $data): Sale {
 
-                $item = new SaleItem([
-                    'sale_id' => $sale->id,
-                    'product_id' => $product->id,
-                    'prescription_item_id' => $line['prescription_item_id'] ?? null,
-                    'product_name' => $product->name,
-                    'sku' => $product->sku,
-                    'unit' => $line['unit_code'] ?? $product->unit,
-                    'quantity' => $line['quantity'],
-                    'unit_price' => $line['unit_price'],
-                    'unit_cost' => $line['unit_cost'],
-                    'subtotal' => $line['subtotal'],
-                    'line_total' => $line['subtotal'],
-                    'variant_id' => $line['variant_id'] ?? null,
-                    'unit_id' => $line['unit_id'] ?? null,
-                    'unit_factor' => $line['unit_factor'] ?? 1,
-                    'kit_line' => (bool) ($line['kit_line'] ?? false),
-                    'parent_sale_item_id' => isset($line['parent_sale_item_ref'])
-                        ? ($refToItemId[$line['parent_sale_item_ref']] ?? null)
-                        : null,
-                ]);
-                $item->business_id = $businessId;
-                $item->save();
-                // Guardar id como referencia por si líneas siguientes lo referencian
-                $refToItemId['idx-'.$idx] = $item->id;
-                if (! empty($line['kit_ref'])) {
-                    $refToItemId[$line['kit_ref']] = $item->id;
-                }
-            }
+                $refToItemId = []; // mapea parent_sale_item_ref -> saleItem->id
+                foreach ($lines as $idx => $line) {
+                    /** @var Product $product */
+                    $product = $line['product'];
 
-            // Aplicar dispensación acumulada en las recetas asociadas
-            if ($rxQtyPending !== []) {
-                $rxSvc = app(PrescriptionService::class);
-                foreach ($rxQtyPending as $rxItemId => $qty) {
-                    $rxItem = $rxItemsCache[$rxItemId] ?? PrescriptionItem::withoutBusinessScope()
-                        ->find($rxItemId);
-                    if ($rxItem) {
-                        $rxSvc->applyDispense($rxItem, (float) $qty);
+                    $item = new SaleItem([
+                        'sale_id' => $sale->id,
+                        'product_id' => $product->id,
+                        'prescription_item_id' => $line['prescription_item_id'] ?? null,
+                        'product_name' => $product->name,
+                        'sku' => $product->sku,
+                        'unit' => $line['unit_code'] ?? $product->unit,
+                        'quantity' => $line['quantity'],
+                        'unit_price' => $line['unit_price'],
+                        'unit_cost' => $line['unit_cost'],
+                        'subtotal' => $line['subtotal'],
+                        'line_total' => $line['subtotal'],
+                        'variant_id' => $line['variant_id'] ?? null,
+                        'unit_id' => $line['unit_id'] ?? null,
+                        'unit_factor' => $line['unit_factor'] ?? 1,
+                        'kit_line' => (bool) ($line['kit_line'] ?? false),
+                        'parent_sale_item_id' => isset($line['parent_sale_item_ref'])
+                            ? ($refToItemId[$line['parent_sale_item_ref']] ?? null)
+                            : null,
+                    ]);
+                    $item->business_id = $businessId;
+                    $item->save();
+                    // Guardar id como referencia por si líneas siguientes lo referencian
+                    $refToItemId['idx-'.$idx] = $item->id;
+                    if (! empty($line['kit_ref'])) {
+                        $refToItemId[$line['kit_ref']] = $item->id;
                     }
                 }
-            }
 
-            // Ítems listos → inventario + contabilidad + caja (idempotente)
-            $sale->load('items');
-            app(SaleObserver::class)->processCompletedSale(
-                $sale,
-                skipInventory: (bool) ($data['skip_inventory'] ?? false),
-            );
+                // Aplicar dispensación acumulada en las recetas asociadas
+                if ($rxQtyPending !== []) {
+                    $rxSvc = app(PrescriptionService::class);
+                    foreach ($rxQtyPending as $rxItemId => $qty) {
+                        $rxItem = $rxItemsCache[$rxItemId] ?? PrescriptionItem::withoutBusinessScope()
+                            ->find($rxItemId);
+                        if ($rxItem) {
+                            $rxSvc->applyDispense($rxItem, (float) $qty);
+                        }
+                    }
+                }
 
-            return $sale->load(['items', 'customer', 'cashier', 'creator']);
+                // Ítems listos → inventario + contabilidad + caja (idempotente)
+                app(SaleFinancialIntegrity::class)->seal($sale);
+                $sale->load('items');
+                app(SaleObserver::class)->processCompletedSale(
+                    $sale,
+                    skipInventory: (bool) ($data['skip_inventory'] ?? false),
+                );
+
+                return $sale->load(['items', 'customer', 'cashier', 'creator']);
+            });
         });
 
         return $sale;
@@ -767,6 +810,13 @@ class SaleService implements RecordsSale
 
         // Fiado / crédito → CxC
         if ($normalized->isCredit()) {
+            if ((int) $sale->credit_version === 1) {
+                $receivable = app(SaleCreditService::class)->refund($sale, number_format($amount, 2, '.', ''));
+                $extra = (float) $receivable->paid_amount > (float) $receivable->amount
+                    ? ' — el cliente ya había pagado más de lo que quedó, verifica reembolso.' : '';
+
+                return ['receivable', 'CxC reducida en RD$ '.number_format($amount, 2).$extra];
+            }
             $saleNumber = $sale->sale_number ?: $sale->number ?: (string) $sale->id;
             $reference = 'Venta '.$saleNumber;
 
@@ -818,9 +868,13 @@ class SaleService implements RecordsSale
 
         return DB::transaction(function () use ($sale): Sale {
             $sale = Sale::withoutBusinessScope()
+                ->where('business_id', $sale->business_id)
                 ->whereKey($sale->id)
                 ->lockForUpdate()
                 ->firstOrFail();
+            if (! $sale->isCancellable()) {
+                throw new RuntimeException('Solo se pueden anular ventas completadas.');
+            }
 
             $sale->load('items');
 
