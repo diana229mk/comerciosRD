@@ -209,13 +209,15 @@ class AccountingService
                     }
 
                     // 4. Costo de Ventas + Inventario
+                    // DATA-03: un unit_cost explícito de 0 es legítimo (producto sin costo).
+                    // Solo se usa el costo actual del producto cuando unit_cost es null (dato faltante).
                     $totalCost = 0.0;
                     foreach ($sale->items as $item) {
-                        $unitCost = (float) ($item->unit_cost ?? 0);
-                        if ($unitCost <= 0) {
-                            $unitCost = (float) ($item->product?->cost ?? 0);
+                        $unitCost = $item->unit_cost;
+                        if ($unitCost === null) {
+                            $unitCost = $item->product?->cost ?? 0;
                         }
-                        $totalCost += $unitCost * (float) $item->quantity;
+                        $totalCost += (float) $unitCost * (float) $item->quantity;
                     }
                     $totalCost = round($totalCost, 2);
 
