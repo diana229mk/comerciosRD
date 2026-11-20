@@ -465,9 +465,16 @@ class ReceivablePaymentConcurrencyTest extends TestCase
         $this->processes[] = $process;
         $process->start();
         $worker = ['process' => $process, 'input' => $input];
+        $startedAt = microtime(true);
         $ready = $this->line($worker, 'READY:', 30);
         if ($ready === null || ! ctype_digit($ready)) {
-            $this->fail('El worker no arrancó: '.$process->getErrorOutput());
+            $diagnostics = [
+                'running' => $process->isRunning(), 'exit_code' => $process->getExitCode(),
+                'elapsed_s' => round(microtime(true) - $startedAt, 2),
+                'stdout' => $process->getOutput(), 'stderr' => $process->getErrorOutput(),
+                'processlist' => DB::select('SELECT id, command, time, state, LEFT(info, 200) AS info FROM information_schema.processlist WHERE db = DATABASE() AND id <> CONNECTION_ID()'),
+            ];
+            $this->fail('El worker no arrancó: '.json_encode($diagnostics, JSON_UNESCAPED_UNICODE | JSON_PARTIAL_OUTPUT_ON_ERROR));
         }
         $worker['connection'] = (int) $ready;
 

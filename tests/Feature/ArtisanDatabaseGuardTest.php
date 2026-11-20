@@ -3,13 +3,21 @@
 namespace Tests\Feature;
 
 use App\Console\ArtisanCommandGate;
+use App\Support\DatabaseConnectionGuard;
 use App\Support\DatabaseTargetPolicy;
 use App\Support\DatabaseTargetViolation;
 use App\Support\ProcessEnvironment;
+use Illuminate\Contracts\Console\Kernel;
+use Illuminate\Database\Connection;
+use Illuminate\Database\Console\Migrations\MigrateCommand;
 use Illuminate\Database\Events\QueryExecuted;
+use Illuminate\Database\MySqlConnection;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\DataProvider;
+use Symfony\Component\Console\Input\ArgvInput;
+use Symfony\Component\Console\Input\ArrayInput;
+use Symfony\Component\Console\Output\BufferedOutput;
 use Tests\TestCase;
 
 class ArtisanDatabaseGuardTest extends TestCase
@@ -71,10 +79,10 @@ class ArtisanDatabaseGuardTest extends TestCase
             'driver' => 'mysql', 'url' => '', 'host' => '127.0.0.1', 'port' => '3306',
             'database' => 'comercios_rd', 'username' => 'comercios_user', 'password' => 'x', 'unix_socket' => '',
         ]]);
-        $output = new \Symfony\Component\Console\Output\BufferedOutput;
+        $output = new BufferedOutput;
 
-        $status = $this->app[\Illuminate\Contracts\Console\Kernel::class]->handle(
-            new \Symfony\Component\Console\Input\ArgvInput(['artisan', 'migrate:fre', '--database=rogue', '--force']),
+        $status = $this->app[Kernel::class]->handle(
+            new ArgvInput(['artisan', 'migrate:fre', '--database=rogue', '--force']),
             $output,
         );
 
@@ -100,6 +108,76 @@ class ArtisanDatabaseGuardTest extends TestCase
         } finally {
             config(['database.connections.mysql.database' => DatabaseTargetPolicy::TEST_DATABASE]);
         }
+    }
+
+    public function test_runtime_reconfiguration_is_rejected_when_the_connection_reopens(): void
+    {
+        config(['database.connections.mysql.database' => 'comercios_rd']);
+        DB::purge('mysql');
+
+        try {
+            $violation = $this->targetViolation(fn () => DB::connection('mysql')->select('select 1'));
+            $this->assertStringContainsString('comercios_rd_storage_test', $violation->getMessage());
+        } finally {
+            config(['database.connections.mysql.database' => DatabaseTargetPolicy::TEST_DATABASE]);
+            DB::purge('mysql');
+        }
+
+        $this->assertSame(DatabaseTargetPolicy::TEST_DATABASE, DB::selectOne('SELECT DATABASE() AS db')->db);
+    }
+
+    #[DataProvider('directConnections')]
+    public function test_direct_connections_to_other_targets_are_rejected_before_opening_pdo(array $config): void
+    {
+        config(['database.connections.rogue' => $config]);
+
+        try {
+            $this->targetViolation(fn () => DB::connection('rogue')->select('select 1'));
+        } finally {
+            DB::purge('rogue');
+        }
+    }
+
+    public static function directConnections(): array
+    {
+        return [
+            'real mysql' => [[
+                'driver' => 'mysql', 'url' => '', 'host' => '127.0.0.1', 'port' => '3306',
+                'database' => 'comercios_rd', 'username' => 'comercios_user', 'password' => 'x', 'unix_socket' => '',
+            ]],
+            'mariadb driver' => [[
+                'driver' => 'mariadb', 'url' => '', 'host' => 'test-mysql', 'port' => '3306',
+                'database' => DatabaseTargetPolicy::TEST_DATABASE, 'username' => 'comercios_storage_test',
+                'password' => 'x', 'unix_socket' => '',
+            ]],
+            'sqlite' => [['driver' => 'sqlite', 'database' => ':memory:', 'prefix' => '']],
+        ];
+    }
+
+    public function test_schema_statements_are_revalidated_on_the_executing_connection(): void
+    {
+        $pdoOpened = false;
+        $connection = new MySqlConnection(
+            function () use (&$pdoOpened) {
+                $pdoOpened = true;
+                throw new \LogicException('PDO abierto');
+            },
+            'comercios_rd',
+            '',
+            ['driver' => 'mysql', 'host' => '127.0.0.1', 'port' => '3306', 'database' => 'comercios_rd',
+                'username' => 'comercios_user', 'password' => 'x', 'unix_socket' => '', 'name' => 'direct'],
+        );
+        DatabaseConnectionGuard::attach($connection);
+
+        try {
+            $connection->statement('CREATE TABLE `guard_probe` (`id` bigint unsigned primary key)');
+            $this->fail('El DDL directo no fue bloqueado.');
+        } catch (DatabaseTargetViolation) {
+            $this->assertFalse($pdoOpened);
+        }
+
+        $default = new \ReflectionProperty(Connection::class, 'beforeExecutingCallbacks');
+        $this->assertNotEmpty($default->getValue(DB::connection('mysql')));
     }
 
     public function test_read_only_commands_keep_working_on_the_isolated_database(): void
@@ -128,9 +206,9 @@ class ArtisanDatabaseGuardTest extends TestCase
             'driver' => 'mysql', 'url' => '', 'host' => '127.0.0.1', 'port' => '3306',
             'database' => 'comercios_rd', 'username' => 'comercios_user', 'password' => 'x', 'unix_socket' => '',
         ]]);
-        $command = $this->app->make(\Illuminate\Database\Console\Migrations\MigrateCommand::class);
+        $command = $this->app->make(MigrateCommand::class);
         $command->setLaravel($this->app);
-        $input = new \Symfony\Component\Console\Input\ArrayInput(['--database' => 'real'], $command->getDefinition());
+        $input = new ArrayInput(['--database' => 'real'], $command->getDefinition());
 
         try {
             $this->app['env'] = 'local';
@@ -153,6 +231,27 @@ class ArtisanDatabaseGuardTest extends TestCase
         } finally {
             $this->app['env'] = $original;
         }
+    }
+
+    /**
+     * Lazy connections open PDO inside Connection::run(), which wraps the violation in a QueryException.
+     */
+    private function targetViolation(callable $callback): DatabaseTargetViolation
+    {
+        try {
+            $callback();
+        } catch (\Throwable $exception) {
+            for ($cause = $exception; $cause !== null; $cause = $cause->getPrevious()) {
+                if ($cause instanceof DatabaseTargetViolation) {
+                    $this->assertInstanceOf(DatabaseTargetViolation::class, $cause);
+
+                    return $cause;
+                }
+            }
+            throw $exception;
+        }
+
+        $this->fail('La conexión no fue bloqueada.');
     }
 
     private function assertBlocked(object $command, object $input, string $case, int $level = ArtisanCommandGate::SCHEMA): void
