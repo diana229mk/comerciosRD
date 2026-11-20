@@ -6,6 +6,8 @@ use App\Filament\Resources\SaleResource;
 use App\Models\ElectronicInvoice;
 use App\Models\Sale;
 use App\Models\SaleItemBatch;
+use App\Models\SaleReturnOperation;
+use App\Services\SaleReturnOperationService;
 use App\Services\SaleService;
 use App\Support\EcfFeature;
 use Filament\Actions;
@@ -14,6 +16,7 @@ use Filament\Forms\Components\Component;
 use Filament\Notifications\Notification;
 use Filament\Resources\Pages\ViewRecord;
 use Illuminate\Support\HtmlString;
+use Illuminate\Support\Str;
 
 class ViewSale extends ViewRecord
 {
@@ -47,8 +50,8 @@ class ViewSale extends ViewRecord
                 ->modalDescription(new HtmlString(
                     'Indica cuánta mercancía devuelve el cliente <b>por cada lote despachado</b>.<br>'
                     .'La cantidad regresará al lote original y aumentará el stock.<br>'
-                    .'<b>Reembolso automático:</b> efectivo → sale de caja abierta · '
-                    .'fiado/crédito → reduce la CxC · tarjeta/transferencia → aviso manual.'
+                    .'<b>Reembolso:</b> efectivo requiere caja abierta; si no la hay o el pago fue electrónico, '
+                    .'se crea un pendiente durable. Crédito reduce la CxC y conserva cualquier saldo a reembolsar.'
                 ))
                 ->form(fn () => $this->buildReturnForm())
                 ->action(function (array $data): void {
@@ -76,6 +79,7 @@ class ViewSale extends ViewRecord
                                 $quantities,
                                 true,
                                 isset($data['issue_credit_note']) ? (bool) $data['issue_credit_note'] : null,
+                                isset($data['request_key']) ? (string) $data['request_key'] : null,
                             );
                     } catch (\Throwable $e) {
                         Notification::make()
@@ -98,13 +102,16 @@ class ViewSale extends ViewRecord
                         $lines[] = 'Nota de Crédito e-CF emitida: '.$result['credit_note']->ecf_number;
                     } elseif (! empty($result['credit_note_error'])) {
                         $lines[] = 'No se pudo emitir NC e-CF: '.$result['credit_note_error'];
+                    } elseif ($result['credit_note_status'] === 'pending') {
+                        $lines[] = 'La Nota de Crédito quedó pendiente de emisión/reintento.';
+                    }
+                    if ($result['refund_status'] === 'pending') {
+                        $lines[] = 'El reembolso permanece pendiente de liquidación.';
                     }
 
-                    $color = match ($result['refund_channel']) {
-                        'cash', 'receivable' => 'success',
-                        'manual', 'cash_failed', 'credit_no_receivable' => 'warning',
-                        default => 'success',
-                    };
+                    $hasPending = $result['refund_status'] === 'pending'
+                        || $result['credit_note_status'] === 'pending';
+                    $color = $hasPending ? 'warning' : 'success';
 
                     $notif = Notification::make()
                         ->title('Devolución registrada')
@@ -114,6 +121,58 @@ class ViewSale extends ViewRecord
                     $notif->send();
 
                     $this->refreshFormData(['items']);
+                }),
+
+            Actions\Action::make('liquidar_reembolso')
+                ->label('Liquidar reembolso pendiente')
+                ->icon('heroicon-o-banknotes')
+                ->color('warning')
+                ->visible(fn (): bool => app(SaleReturnOperationService::class)
+                    ->pendingRefundsForSale($this->getRecord()) !== [])
+                ->form([
+                    Forms\Components\Select::make('operation_id')
+                        ->label('Reembolso pendiente')
+                        ->options(fn (): array => app(SaleReturnOperationService::class)
+                            ->pendingRefundsForSale($this->getRecord()))
+                        ->required()
+                        ->native(false),
+                    Forms\Components\Select::make('payment_method')
+                        ->label('Método de liquidación')
+                        ->options([
+                            'efectivo' => 'Efectivo (requiere caja abierta)',
+                            'transferencia' => 'Transferencia',
+                            'tarjeta' => 'Tarjeta',
+                            'cheque' => 'Cheque',
+                        ])
+                        ->required()
+                        ->default('efectivo')
+                        ->native(false),
+                    Forms\Components\Hidden::make('request_key')
+                        ->default(fn (): string => (string) Str::uuid()),
+                ])
+                ->action(function (array $data): void {
+                    try {
+                        $operation = SaleReturnOperation::withoutBusinessScope()
+                            ->where('business_id', $this->getRecord()->business_id)
+                            ->where('sale_id', $this->getRecord()->id)
+                            ->whereKey($data['operation_id'])
+                            ->firstOrFail();
+                        app(SaleReturnOperationService::class)->settleRefund(
+                            $operation,
+                            (string) $data['payment_method'],
+                            (string) $data['request_key'],
+                        );
+                        Notification::make()
+                            ->title('Reembolso liquidado')
+                            ->success()
+                            ->send();
+                    } catch (\Throwable $e) {
+                        Notification::make()
+                            ->title('No se pudo liquidar el reembolso')
+                            ->body($e->getMessage())
+                            ->danger()
+                            ->send();
+                    }
                 }),
         ];
     }
@@ -164,6 +223,8 @@ class ViewSale extends ViewRecord
             ->all();
 
         $schema = [
+            Forms\Components\Hidden::make('request_key')
+                ->default(fn (): string => (string) Str::uuid()),
             Forms\Components\Repeater::make('allocations')
                 ->label('Lotes devolubles')
                 ->default($rows)

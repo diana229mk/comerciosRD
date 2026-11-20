@@ -17,15 +17,20 @@ use App\Models\Payable;
 use App\Models\Product;
 use App\Models\ProductBatch;
 use App\Models\Receivable;
+use App\Models\ReceivablePayment;
+use App\Models\ReceivablePaymentReversal;
 use App\Models\Sale;
 use App\Models\SaleItem;
 use App\Models\SaleItemBatch;
 use App\Models\User;
 use App\Services\AccountingService;
+use App\Services\CashSessionService;
 use App\Services\ControlledDrugLedgerService;
 use App\Services\JournalEntryService;
+use App\Services\ReceivablePaymentService;
 use App\Services\ReportsService;
 use App\Services\SaleFinancialIntegrity;
+use App\Services\SaleReturnOperationService;
 use App\Services\SaleService;
 use App\Support\TenantContext;
 use Illuminate\Foundation\Testing\DatabaseTransactions;
@@ -102,6 +107,273 @@ class FinancialOperationsTest extends TestCase
             $this->assertSame(SaleStatus::Anulada, $sale->fresh()->status);
             $this->assertSame(PaymentMethod::Efectivo, $sale->fresh()->payment_method);
         }
+    }
+
+    public function test_sale_with_a_recorded_return_cannot_be_cancelled_and_restore_inventory_twice(): void
+    {
+        $fixture = $this->saleFixture();
+        AccountingService::createDefaultAccounts($fixture['business']);
+        $beforeReturn = (float) $fixture['product']->fresh()->stock;
+
+        app(SaleService::class)->returnFromAllocations(
+            $fixture['sale'],
+            [$fixture['allocation']->id => 1],
+            true,
+            false,
+            'partial-return-before-cancel',
+        );
+        $afterReturn = (float) $fixture['product']->fresh()->stock;
+        $this->assertSame($beforeReturn + 1, $afterReturn);
+
+        try {
+            app(SaleService::class)->cancel($fixture['sale']->fresh());
+            $this->fail('A sale with a return must not be cancelled and restored again.');
+        } catch (\RuntimeException $exception) {
+            $this->assertStringContainsString('ya tiene devoluciones', $exception->getMessage());
+        }
+
+        $this->assertSame(SaleStatus::Completada, $fixture['sale']->fresh()->status);
+        $this->assertSame($afterReturn, (float) $fixture['product']->fresh()->stock);
+    }
+
+    public function test_cash_receivable_payment_requires_an_open_cash_session(): void
+    {
+        $tenant = $this->businessFixture('Cobro efectivo requiere caja');
+        $this->setTenant($tenant['business'], $tenant['user']);
+        AccountingService::createDefaultAccounts($tenant['business']);
+
+        $receivable = new Receivable;
+        $receivable->forceFill([
+            'id' => (string) Str::uuid(),
+            'business_id' => $tenant['business']->id,
+            'description' => 'CxC sin caja',
+            'amount' => 80,
+            'paid_amount' => 0,
+            'balance' => 80,
+            'due_date' => now()->addDays(10)->toDateString(),
+            'status' => 'pendiente',
+        ])->saveQuietly();
+
+        try {
+            $receivable->registerPayment(25, 'efectivo', requestKey: 'cash-without-session');
+            $this->fail('Cash payments must be rejected when there is no open session.');
+        } catch (\RuntimeException $exception) {
+            $this->assertStringContainsString('No hay una caja abierta', $exception->getMessage());
+        }
+
+        $this->assertSame(0, $receivable->payments()->count());
+        $this->assertSame(80.0, (float) $receivable->fresh()->balance);
+        $this->assertSame(0, JournalEntry::query()->where('business_id', $tenant['business']->id)->count());
+    }
+
+    public function test_cash_receivable_payment_is_traced_and_included_in_cash_reconciliation(): void
+    {
+        $tenant = $this->businessFixture('Cobro CxC reconciliado');
+        $this->setTenant($tenant['business'], $tenant['user']);
+        AccountingService::createDefaultAccounts($tenant['business']);
+
+        $session = new CashSession;
+        $session->forceFill([
+            'id' => (string) Str::uuid(),
+            'business_id' => $tenant['business']->id,
+            'user_id' => $tenant['user']->id,
+            'opening_amount' => 10,
+            'total_sales_cash' => 0,
+            'total_expenses_cash' => 0,
+            'status' => CashSession::STATUS_OPEN,
+            'opened_at' => now()->subMinute(),
+        ])->saveQuietly();
+        $receivable = new Receivable;
+        $receivable->forceFill([
+            'id' => (string) Str::uuid(),
+            'business_id' => $tenant['business']->id,
+            'description' => 'CxC con pago en efectivo',
+            'amount' => 80,
+            'paid_amount' => 0,
+            'balance' => 80,
+            'due_date' => now()->addDays(10)->toDateString(),
+            'status' => 'pendiente',
+        ])->saveQuietly();
+
+        $payment = $receivable->registerPayment(25, 'efectivo', requestKey: 'cash-payment-in-session');
+        $snapshot = app(CashSessionService::class)->preview($session->fresh());
+
+        $this->assertSame($session->id, $payment->cash_session_id);
+        $this->assertSame(25.0, (float) $session->fresh()->total_sales_cash);
+        $this->assertSame(35.0, $snapshot['expected']);
+        $this->assertSame(1, JournalEntry::query()
+            ->where('business_id', $tenant['business']->id)
+            ->where('source_type', 'receivable_payment')
+            ->count());
+    }
+
+    public function test_receivable_payment_is_idempotent_and_rejects_a_conflicting_replay(): void
+    {
+        $tenant = $this->businessFixture('Cobro idempotente');
+        $this->setTenant($tenant['business'], $tenant['user']);
+        AccountingService::createDefaultAccounts($tenant['business']);
+
+        $receivable = new Receivable;
+        $receivable->forceFill([
+            'id' => (string) Str::uuid(),
+            'business_id' => $tenant['business']->id,
+            'description' => 'CxC idempotente',
+            'amount' => 100,
+            'paid_amount' => 0,
+            'balance' => 100,
+            'due_date' => now()->addDays(10)->toDateString(),
+            'status' => 'pendiente',
+        ])->saveQuietly();
+
+        $first = $receivable->registerPayment(25, 'transferencia', requestKey: 'collection-replay-1');
+        $replay = $receivable->fresh()->registerPayment(25, 'transferencia', requestKey: 'collection-replay-1');
+
+        $this->assertSame($first->id, $replay->id);
+        $this->assertSame(1, $receivable->payments()->count());
+        $this->assertSame(75.0, (float) $receivable->fresh()->balance);
+        $this->assertSame(1, JournalEntry::query()
+            ->where('business_id', $tenant['business']->id)
+            ->where('source_type', 'receivable_payment')
+            ->where('source_id', $first->id)
+            ->count());
+
+        try {
+            $receivable->fresh()->registerPayment(26, 'transferencia', requestKey: 'collection-replay-1');
+            $this->fail('A conflicting idempotency replay must be rejected.');
+        } catch (ValidationException $exception) {
+            $this->assertArrayHasKey('request_key', $exception->errors());
+        }
+        $this->assertSame(1, $receivable->payments()->count());
+    }
+
+    public function test_receivable_payment_reversal_keeps_history_and_reopens_balance_atomically(): void
+    {
+        $tenant = $this->businessFixture('Anulación auditable CxC');
+        $this->setTenant($tenant['business'], $tenant['user']);
+        AccountingService::createDefaultAccounts($tenant['business']);
+
+        $receivable = new Receivable;
+        $receivable->forceFill([
+            'id' => (string) Str::uuid(),
+            'business_id' => $tenant['business']->id,
+            'description' => 'CxC con reverso',
+            'amount' => 100,
+            'paid_amount' => 0,
+            'balance' => 100,
+            'due_date' => now()->addDays(10)->toDateString(),
+            'status' => 'pendiente',
+        ])->saveQuietly();
+        $payment = $receivable->registerPayment(40, 'transferencia', requestKey: 'collection-to-reverse');
+
+        $service = app(ReceivablePaymentService::class);
+        $reversal = $service->reverse($payment, 'Error de captura', 'reversal-request-1');
+        $replay = $service->reverse($payment, 'Error de captura', 'reversal-request-1');
+
+        $this->assertInstanceOf(ReceivablePaymentReversal::class, $reversal);
+        $this->assertSame($reversal->id, $replay->id);
+        $this->assertSame(1, $receivable->payments()->count());
+        $this->assertSame($reversal->id, $payment->fresh()->reversal->id);
+        $this->assertSame(0.0, (float) $receivable->fresh()->paid_amount);
+        $this->assertSame(100.0, (float) $receivable->fresh()->balance);
+        $this->assertSame(2, JournalEntry::query()
+            ->where('business_id', $tenant['business']->id)
+            ->whereIn('source_type', ['receivable_payment', 'receivable_payment_reversal'])
+            ->count());
+    }
+
+    public function test_sale_return_replay_is_idempotent_and_cash_refund_can_be_settled_later(): void
+    {
+        $fixture = $this->saleFixture();
+        AccountingService::createDefaultAccounts($fixture['business']);
+        $sale = $fixture['sale'];
+        $quantities = [$fixture['allocation']->id => 2];
+
+        $first = app(SaleService::class)->returnFromAllocations(
+            $sale,
+            $quantities,
+            true,
+            false,
+            'sale-return-request-1',
+        );
+        $replay = app(SaleService::class)->returnFromAllocations(
+            $sale->fresh(),
+            $quantities,
+            true,
+            false,
+            'sale-return-request-1',
+        );
+
+        $this->assertSame($first['operation']->id, $replay['operation']->id);
+        try {
+            app(SaleService::class)->returnFromAllocations(
+                $sale->fresh(),
+                [$fixture['allocation']->id => 1],
+                true,
+                false,
+                'sale-return-request-1',
+            );
+            $this->fail('A conflicting idempotency replay must be rejected.');
+        } catch (ValidationException $exception) {
+            $this->assertArrayHasKey('request_key', $exception->errors());
+        }
+        $this->assertSame(1, InventoryMovement::query()
+            ->where('sale_return_operation_id', $first['operation']->id)
+            ->count());
+        $this->assertSame('pending', $first['refund_status']);
+
+        $session = new CashSession;
+        $session->forceFill([
+            'id' => (string) Str::uuid(),
+            'business_id' => $fixture['business']->id,
+            'user_id' => $fixture['user']->id,
+            'opening_amount' => 500,
+            'total_sales_cash' => 0,
+            'total_expenses_cash' => 0,
+            'status' => CashSession::STATUS_OPEN,
+            'opened_at' => now()->subMinute(),
+        ])->saveQuietly();
+
+        $settled = app(SaleReturnOperationService::class)->settleRefund(
+            $first['operation'],
+            'efectivo',
+            'settle-return-cash-1',
+        );
+        $this->assertSame('settled', $settled->refund_status);
+        $this->assertSame($session->id, $settled->refund_cash_session_id);
+        $this->assertSame($first['refund_amount'], (float) $session->fresh()->total_expenses_cash);
+        $this->assertSame(1, JournalEntry::query()
+            ->where('business_id', $fixture['business']->id)
+            ->where('source_type', 'sale_return_refund_settlement')
+            ->where('source_id', $settled->id)
+            ->count());
+    }
+
+    public function test_failed_credit_note_is_kept_for_durable_retry_after_sale_return(): void
+    {
+        config([
+            'ecf.enabled' => true,
+            'ecf.validation_approved' => true,
+        ]);
+        $fixture = $this->saleFixture();
+        AccountingService::createDefaultAccounts($fixture['business']);
+
+        $result = app(SaleService::class)->returnFromAllocations(
+            $fixture['sale'],
+            [$fixture['allocation']->id => 1],
+            true,
+            true,
+            'credit-note-retry-1',
+        );
+        $this->assertSame('pending', $result['credit_note_status']);
+
+        $retry = app(SaleReturnOperationService::class)->retryDueCreditNotes();
+        $operation = $result['operation']->fresh();
+
+        $this->assertSame(1, $retry['deferred']);
+        $this->assertSame('pending', $operation->ecf_status);
+        $this->assertSame(1, $operation->ecf_attempts);
+        $this->assertStringContainsString('RNC', (string) $operation->ecf_last_error);
+        $this->assertNotNull($operation->ecf_available_at);
     }
 
     public function test_existing_sale_cannot_borrow_a_new_sale_construction_scope(): void
@@ -251,7 +523,7 @@ class FinancialOperationsTest extends TestCase
         $this->assertSame(106.20, $first['refund_amount']);
         $this->assertSame(9.0, (float) $batch->fresh()->quantity);
         $this->assertSame(9.0, (float) $product->fresh()->stock);
-        $this->assertSame(106.20, (float) $session->fresh()->total_sales_cash);
+        $this->assertSame(106.20, (float) $session->fresh()->total_expenses_cash);
 
         $second = app(SaleService::class)->returnFromAllocations(
             $sale->fresh(),
@@ -264,7 +536,7 @@ class FinancialOperationsTest extends TestCase
         $this->assertSame(212.40, $first['refund_amount'] + $second['refund_amount']);
         $this->assertSame(10.0, (float) $batch->fresh()->quantity);
         $this->assertSame(10.0, (float) $product->fresh()->stock);
-        $this->assertSame(0.0, (float) $session->fresh()->total_sales_cash);
+        $this->assertSame(212.40, (float) $session->fresh()->total_expenses_cash);
         $this->assertSame(2, InventoryMovement::query()
             ->where('reference_id', $sale->id)
             ->where('type', InventoryMovement::TYPE_RETURN_IN)
@@ -283,7 +555,7 @@ class FinancialOperationsTest extends TestCase
         }
 
         $this->assertSame(10.0, (float) $batch->fresh()->quantity);
-        $this->assertSame(0.0, (float) $session->fresh()->total_sales_cash);
+        $this->assertSame(212.40, (float) $session->fresh()->total_sales_cash);
     }
 
     public function test_return_rejects_excess_and_negative_quantities_without_partial_changes(): void
@@ -439,6 +711,64 @@ class FinancialOperationsTest extends TestCase
         $this->assertSame(118.0, (float) $receivable->fresh()->balance);
     }
 
+    public function test_receivable_payment_for_business_is_scoped_for_a_multi_business_user(): void
+    {
+        $first = $this->businessFixture('CxC scope primer negocio');
+        $businessA = $first['business'];
+        $user = $first['user'];
+        $businessB = Business::create([
+            'name' => 'CxC scope segundo negocio',
+            'type' => BusinessType::Colmado,
+            'owner_id' => $user->id,
+            'is_active' => true,
+        ]);
+        $user->businesses()->attach($businessB->id, ['role' => 'owner', 'is_active' => true]);
+
+        $this->assertTrue($user->belongsToBusiness((string) $businessA->id));
+        $this->assertTrue($user->belongsToBusiness((string) $businessB->id));
+
+        $createReceivable = function (Business $business) use ($user): Receivable {
+            return TenantContext::run((string) $business->id, fn () => Receivable::create([
+                'customer_name' => 'Cliente '.$business->name,
+                'reference' => 'FOR-BUSINESS-'.$business->id,
+                'description' => 'Saldo de prueba para '.$business->name,
+                'amount' => 100,
+                'paid_amount' => 0,
+                'balance' => 100,
+                'due_date' => now()->addDays(7)->toDateString(),
+                'status' => 'pendiente',
+                'created_by' => $user->id,
+            ]));
+        };
+        $receivableA = $createReceivable($businessA);
+        $receivableB = $createReceivable($businessB);
+        AccountingService::createDefaultAccounts($businessA);
+        AccountingService::createDefaultAccounts($businessB);
+        $paymentA = TenantContext::run((string) $businessA->id,
+            fn () => $receivableA->registerPayment(10, 'transferencia', requestKey: 'tenant-a-payment'));
+        $paymentB = TenantContext::run((string) $businessB->id,
+            fn () => $receivableB->registerPayment(20, 'transferencia', requestKey: 'tenant-b-payment'));
+
+        $this->setTenant($businessB, $user);
+
+        $this->assertSame(
+            [(string) $paymentA->id],
+            ReceivablePayment::query()->forBusiness((string) $businessA->id)->orderBy('id')->pluck('id')->all(),
+        );
+        $this->assertSame(
+            [(string) $paymentB->id],
+            ReceivablePayment::query()->forBusiness((string) $businessB->id)->orderBy('id')->pluck('id')->all(),
+        );
+        $this->assertSame(
+            [(string) $paymentA->id],
+            $receivableA->payments()->forBusiness((string) $businessA->id)->orderBy('id')->pluck('id')->all(),
+        );
+        $this->assertSame(
+            [],
+            $receivableA->payments()->forBusiness((string) $businessB->id)->orderBy('id')->pluck('id')->all(),
+        );
+    }
+
     public function test_cash_return_without_an_open_session_is_marked_for_manual_refund(): void
     {
         $fixture = $this->saleFixture();
@@ -450,8 +780,9 @@ class FinancialOperationsTest extends TestCase
             false,
         );
 
-        $this->assertSame('cash_failed', $result['refund_channel']);
-        $this->assertStringContainsString('registra el reembolso manualmente', $result['refund_note']);
+        $this->assertSame('cash_pending', $result['refund_channel']);
+        $this->assertSame('pending', $result['refund_status']);
+        $this->assertStringContainsString('Reembolso pendiente', $result['refund_note']);
         $this->assertSame(9.0, (float) $fixture['batch']->fresh()->quantity);
         $this->assertSame(9.0, (float) $fixture['product']->fresh()->stock);
     }
@@ -532,7 +863,7 @@ class FinancialOperationsTest extends TestCase
         $this->assertSame(296.0, (float) $entry->total_debit);
         $this->assertSame(296.0, (float) $entry->total_credit);
         $this->assertTrue($entry->isBalanced());
-        $this->assertSame(14, Account::query()
+        $this->assertSame(15, Account::query()
             ->where('business_id', $fixture['business']->id)
             ->count());
 
@@ -696,10 +1027,10 @@ class FinancialOperationsTest extends TestCase
         app()->instance('currentBusinessId', $first['business']->id);
         $second = $this->businessFixture('Segundo negocio');
 
-        $this->assertSame(14, Account::withoutBusinessScope()
+        $this->assertSame(15, Account::withoutBusinessScope()
             ->where('business_id', $first['business']->id)
             ->count());
-        $this->assertSame(14, Account::withoutBusinessScope()
+        $this->assertSame(15, Account::withoutBusinessScope()
             ->where('business_id', $second['business']->id)
             ->count());
         $this->assertSame($first['business']->id, app('currentBusinessId'));
@@ -1088,7 +1419,10 @@ class FinancialOperationsTest extends TestCase
                 ->where('reference_id', $fixture['sale']->id)
                 ->where('type', InventoryMovement::TYPE_RETURN_IN)
                 ->count(),
-            'cash_total' => (float) ($fixture['cash_session']?->fresh()->total_sales_cash ?? 0),
+            'cash_total' => (float) ($fixture['cash_session']
+                ? (float) $fixture['cash_session']->fresh()->total_sales_cash
+                    - (float) $fixture['cash_session']->fresh()->total_expenses_cash
+                : 0),
         ];
     }
 }

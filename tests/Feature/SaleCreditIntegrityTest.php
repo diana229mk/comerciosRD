@@ -397,6 +397,7 @@ class SaleCreditIntegrityTest extends TestCase
         $command = $this->command($fixture);
         $sale = app(SaleService::class)->create($command);
         $receivable = app(SaleCreditService::class)->assertReceivable($sale);
+        AccountingService::createDefaultAccounts($fixture['business']);
         $receivable->registerPayment(20, 'transferencia');
         app(SaleCreditService::class)->refund($sale, '18.00');
         app(SaleService::class)->create($command);
@@ -455,6 +456,7 @@ class SaleCreditIntegrityTest extends TestCase
         $this->actingAs($accountant);
         session(['current_branch_id' => $second->id]);
         $this->assertFalse(Sale::withoutBusinessScope()->whereKey($sale->id)->exists());
+        AccountingService::createDefaultAccounts($fixture['business']);
         $receipt->registerPayment(20, 'transferencia');
         $this->assertSame('98.00', $receipt->fresh()->balance);
         $this->assertSame('20.00', $receipt->fresh()->paid_amount);

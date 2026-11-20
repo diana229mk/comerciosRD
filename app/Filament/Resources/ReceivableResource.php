@@ -17,6 +17,7 @@ use Filament\Tables;
 use Filament\Tables\Table;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\SoftDeletingScope;
+use Illuminate\Support\Str;
 
 class ReceivableResource extends Resource
 {
@@ -277,6 +278,9 @@ class ReceivableResource extends Resource
         $balance = (float) ($record?->balance ?? 0);
 
         return [
+            Forms\Components\Hidden::make('request_key')
+                ->default(fn (): string => (string) Str::uuid()),
+
             Forms\Components\Placeholder::make('info')
                 ->label('Saldo pendiente')
                 ->content('RD$ '.number_format($balance, 2)),
@@ -300,7 +304,7 @@ class ReceivableResource extends Resource
                 ->required()
                 ->default('efectivo')
                 ->native(false)
-                ->helperText('Si es efectivo, se suma a la caja abierta (si hay una).'),
+                ->helperText('El cobro en efectivo requiere una caja abierta.'),
 
             Forms\Components\DatePicker::make('payment_date')
                 ->label('Fecha de cobro')
@@ -344,10 +348,11 @@ class ReceivableResource extends Resource
             paymentDate: isset($data['payment_date']) ? (string) $data['payment_date'] : null,
             reference: $data['reference'] ?? null,
             notes: $data['notes'] ?? null,
+            requestKey: isset($data['request_key']) ? (string) $data['request_key'] : null,
         );
 
         $cashNote = in_array(strtolower($method), ['efectivo', 'cash'], true)
-            ? ' · Sumado a caja (si hay sesión abierta)'
+            ? ' · Registrado en caja'
             : '';
 
         Notification::make()

@@ -2,10 +2,14 @@
 
 namespace App\Filament\Resources\ReceivableResource\RelationManagers;
 
+use App\Services\ReceivablePaymentService;
+use Filament\Forms;
 use Filament\Forms\Form;
+use Filament\Notifications\Notification;
 use Filament\Resources\RelationManagers\RelationManager;
 use Filament\Tables;
 use Filament\Tables\Table;
+use Illuminate\Support\Str;
 
 class PaymentsRelationManager extends RelationManager
 {
@@ -37,7 +41,14 @@ class PaymentsRelationManager extends RelationManager
                     ->label('Monto')
                     ->money('DOP')
                     ->weight('bold')
-                    ->color('success'),
+                    ->color(fn ($record): string => $record->reversal ? 'danger' : 'success'),
+
+                Tables\Columns\TextColumn::make('reversal.created_at')
+                    ->label('Estado')
+                    ->dateTime('d/m/Y H:i')
+                    ->placeholder('Vigente')
+                    ->badge()
+                    ->color(fn ($record): string => $record->reversal ? 'danger' : 'success'),
 
                 Tables\Columns\TextColumn::make('payment_method')
                     ->label('Método')
@@ -79,17 +90,31 @@ class PaymentsRelationManager extends RelationManager
             ->defaultSort('payment_date', 'desc')
             ->headerActions([])
             ->actions([
-                Tables\Actions\DeleteAction::make()
+                Tables\Actions\Action::make('anular')
                     ->label('Anular')
                     ->modalHeading('Anular este cobro')
-                    ->modalDescription('Se restará del total cobrado y se actualizará el saldo. Si fue en efectivo, se revierte de la caja abierta (si existe).')
-                    ->before(function ($record): void {
-                        if (in_array(strtolower((string) $record->payment_method), ['efectivo', 'cash'], true)) {
-                            app(\App\Services\CashSessionService::class)->reverseCashAmount(
-                                (string) $record->business_id,
-                                (float) $record->amount,
-                            );
-                        }
+                    ->modalDescription('Se conservará el cobro original y se registrará un reverso contable y de caja. Para cobros en efectivo se requiere una caja abierta.')
+                    ->visible(fn ($record): bool => $record->reversal === null)
+                    ->form([
+                        Forms\Components\Hidden::make('request_key')
+                            ->default(fn (): string => (string) Str::uuid()),
+                        Forms\Components\Textarea::make('reason')
+                            ->label('Motivo')
+                            ->required()
+                            ->maxLength(2000),
+                    ])
+                    ->action(function ($record, array $data): void {
+                        app(ReceivablePaymentService::class)->reverse(
+                            $record,
+                            (string) $data['reason'],
+                            (string) $data['request_key'],
+                        );
+
+                        Notification::make()
+                            ->title('Cobro anulado')
+                            ->body('Se registró el reverso sin eliminar el historial.')
+                            ->success()
+                            ->send();
                     }),
             ])
             ->bulkActions([])

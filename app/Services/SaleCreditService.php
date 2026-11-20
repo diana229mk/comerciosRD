@@ -182,6 +182,16 @@ final class SaleCreditService
             foreach ($payments as $payment) {
                 $paid += self::cents($payment->amount);
             }
+            $reversed = DB::table('receivable_payment_reversals as reversals')
+                ->join('receivable_payments as payments', function ($join): void {
+                    $join->on('payments.id', '=', 'reversals.receivable_payment_id')
+                        ->on('payments.business_id', '=', 'reversals.business_id');
+                })
+                ->where('payments.business_id', $locked->business_id)
+                ->where('payments.receivable_id', $locked->id)
+                ->lockForUpdate()
+                ->sum('payments.amount');
+            $paid = max(0, $paid - self::cents($reversed));
             $balance = max(0, self::cents($locked->amount) - $paid);
             $locked->forceFill([
                 'paid_amount' => self::decimal($paid), 'balance' => self::decimal($balance),

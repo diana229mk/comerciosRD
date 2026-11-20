@@ -5,6 +5,7 @@ namespace App\Services;
 use App\Enums\PaymentMethod;
 use App\Enums\SaleStatus;
 use App\Models\CashSession;
+use App\Models\CashSessionMovement;
 use App\Models\Expense;
 use App\Models\Sale;
 use App\Models\User;
@@ -182,10 +183,102 @@ class CashSessionService
         }
         $expenses = (float) $expensesQuery->sum('amount');
 
+        $cashMovements = CashSessionMovement::withoutBusinessScope()
+            ->where('business_id', $session->business_id)
+            ->where('cash_session_id', $session->getKey());
+        $cashIn = (float) (clone $cashMovements)->where('direction', 'in')->sum('amount');
+        $cashOut = (float) (clone $cashMovements)->where('direction', 'out')->sum('amount');
+
         return [
-            'sales' => round($sales, 2),
-            'expenses' => round($expenses, 2),
+            'sales' => round($sales + $cashIn, 2),
+            'expenses' => round($expenses + $cashOut, 2),
         ];
+    }
+
+    public function lockOpenSessionForMovement(
+        string $businessId,
+        ?string $userId,
+        mixed $asOf = null,
+    ): CashSession {
+        $session = $this->findOpenSessionForMovement($businessId, $userId, $asOf);
+        if (! $session) {
+            throw new RuntimeException('No hay una caja abierta para registrar este movimiento en efectivo.');
+        }
+
+        return $session;
+    }
+
+    public function findOpenSessionForMovement(
+        string $businessId,
+        ?string $userId,
+        mixed $asOf = null,
+    ): ?CashSession {
+        if (DB::transactionLevel() < 1) {
+            throw new RuntimeException('La sesión de caja debe bloquearse dentro de la transacción financiera.');
+        }
+
+        $query = CashSession::withoutBusinessScope()
+            ->where('business_id', $businessId)
+            ->where('status', CashSession::STATUS_OPEN)
+            ->where('opened_at', '<=', $asOf ?? now())
+            ->orderByDesc('opened_at');
+        if ($userId) {
+            $query->where('user_id', $userId);
+        }
+
+        return $query->lockForUpdate()->first();
+    }
+
+    public function recordMovementForSession(
+        CashSession $session,
+        string $businessId,
+        string $sourceType,
+        string $sourceId,
+        string $direction,
+        int $amountCents,
+        ?string $userId,
+    ): CashSessionMovement {
+        if (DB::transactionLevel() < 1) {
+            throw new RuntimeException('El movimiento de caja debe registrarse dentro de la transacción financiera.');
+        }
+        if (! in_array($direction, ['in', 'out'], true) || $amountCents <= 0
+            || (string) $session->business_id !== $businessId
+            || $session->status !== CashSession::STATUS_OPEN) {
+            throw new RuntimeException('El movimiento de caja no es válido para esta sesión.');
+        }
+
+        $movement = CashSessionMovement::withoutBusinessScope()
+            ->where('business_id', $businessId)
+            ->where('source_type', $sourceType)
+            ->where('source_id', $sourceId)
+            ->where('direction', $direction)
+            ->lockForUpdate()
+            ->first();
+        $amount = SaleCreditService::decimal($amountCents);
+        if ($movement) {
+            if ((string) $movement->cash_session_id !== (string) $session->getKey()
+                || SaleCreditService::cents($movement->amount) !== $amountCents) {
+                throw new RuntimeException('El movimiento de caja ya existe con datos diferentes.');
+            }
+
+            return $movement;
+        }
+
+        $movement = new CashSessionMovement([
+            'cash_session_id' => $session->getKey(),
+            'source_type' => $sourceType,
+            'source_id' => $sourceId,
+            'direction' => $direction,
+            'amount' => $amount,
+            'created_by' => $userId,
+        ]);
+        $movement->business_id = $businessId;
+        $movement->saveQuietly();
+
+        $column = $direction === 'in' ? 'total_sales_cash' : 'total_expenses_cash';
+        $session->increment($column, (float) $amount);
+
+        return $movement;
     }
 
     public function currentOpen(?User $user = null): ?CashSession

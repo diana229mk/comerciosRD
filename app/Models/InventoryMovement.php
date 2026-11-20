@@ -57,6 +57,7 @@ class InventoryMovement extends Model
         'unit_cost',
         'reason',
         'reference_id',
+        'sale_return_operation_id',
         'reference_type',
         'created_by',
     ];
