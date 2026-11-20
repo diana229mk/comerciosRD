@@ -51,6 +51,13 @@ RUN apt-get update \
 
 COPY --from=composer:2.8 /usr/bin/composer /usr/local/bin/composer
 
+# Root-owned, read-only contract proving the authorized isolated test runtime.
+# The compose test services must also export COMERCIOS_TEST_RUNTIME with the same id.
+RUN install -d -o root -g root -m 0755 /etc/comercios-rd \
+    && printf '{"id":"comercios-rd-isolated-tests/v1"}\n' > /etc/comercios-rd/test-runtime.json \
+    && chown root:root /etc/comercios-rd/test-runtime.json \
+    && chmod 0444 /etc/comercios-rd/test-runtime.json
+
 WORKDIR /var/www/html
 
 COPY composer.json composer.lock ./
@@ -73,6 +80,7 @@ RUN mkdir -p \
         storage/logs \
         bootstrap/cache \
     && ln -s ../storage/app/public public/storage \
+    && rm -f bootstrap/cache/config.php \
     && chown -R www-data:www-data storage bootstrap/cache \
     && APP_ENV=testing APP_KEY=base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \
         php artisan package:discover --ansi

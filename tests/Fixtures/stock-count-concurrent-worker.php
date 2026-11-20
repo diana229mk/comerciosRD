@@ -13,6 +13,7 @@ use Illuminate\Support\Facades\DB;
 require dirname(__DIR__, 2).'/vendor/autoload.php';
 
 try {
+    require __DIR__.'/_guard.php';
     $prefix = getenv('STOCK_COUNT_TEST_PREFIX');
     if (getenv('APP_ENV') !== 'testing' || ! is_string($prefix)
         || preg_match('/^crd_count_test_[a-f0-9]{16}_$/D', $prefix) !== 1) {

@@ -4,6 +4,7 @@ namespace App\Console\Commands;
 
 use App\Services\MysqlTlsPolicy;
 use App\Services\PortabilityRestoreOperations;
+use App\Support\DatabaseTargetPolicy;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
@@ -146,6 +147,7 @@ class PortabilityBackup extends Command
     protected function mysqlCnf(string $binary): string
     {
         $conn = config('database.connections.mysql');
+        DatabaseTargetPolicy::assertExternalClientAllowed((array) $conn);
         $tlsOptions = MysqlTlsPolicy::clientOptions($conn, $binary);
         $user = MysqlTlsPolicy::quote((string) ($conn['username'] ?? ''));
         $pass = MysqlTlsPolicy::quote((string) ($conn['password'] ?? ''));

@@ -16,6 +16,7 @@ use Illuminate\Validation\ValidationException;
 require dirname(__DIR__, 2).'/vendor/autoload.php';
 
 try {
+    require __DIR__.'/_guard.php';
     $prefix = getenv('F2_TEST_PREFIX');
     $mode = getenv('F2_TEST_MODE');
     if (getenv('APP_ENV') !== 'testing' || getenv('ACCOUNTING_QUEUE_INTEGRATION') !== '1'

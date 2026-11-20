@@ -5,11 +5,17 @@ use App\Http\Middleware\ContentSecurityPolicy;
 use App\Http\Middleware\RestoreLaravelRedirector;
 use App\Http\Middleware\SecurityHeaders;
 use App\Http\Middleware\SessionFingerprint;
+use App\Support\DatabaseTargetPolicy;
+use App\Support\ProcessEnvironment;
 use Illuminate\Foundation\Application;
+use Illuminate\Foundation\Bootstrap\LoadConfiguration;
 use Illuminate\Foundation\Configuration\Exceptions;
 use Illuminate\Foundation\Configuration\Middleware;
 
-return Application::configure(basePath: dirname(__DIR__))
+// Capture approval/runtime variables before any .env file is loaded.
+ProcessEnvironment::capture();
+
+$app = Application::configure(basePath: dirname(__DIR__))
     ->withRouting(
         web: __DIR__.'/../routes/web.php',
         commands: __DIR__.'/../routes/console.php',
@@ -89,3 +95,14 @@ return Application::configure(basePath: dirname(__DIR__))
             return new \Illuminate\Http\RedirectResponse($dest);
         });
     })->create();
+
+// Every Artisan command passes through GuardedArtisan::doRunCommand().
+$app->singleton(\Illuminate\Contracts\Console\Kernel::class, \App\Console\Kernel::class);
+
+// Validate the database target after configuration loads and before any provider runs.
+$app->afterBootstrapping(
+    LoadConfiguration::class,
+    static fn (Application $app) => DatabaseTargetPolicy::assertBootConfiguration($app),
+);
+
+return $app;
