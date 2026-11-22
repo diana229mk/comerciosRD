@@ -26,6 +26,10 @@ Fecha de corte: 2026-10-28. Destino evaluado: DigitalOcean. Stack: Laravel 12, F
 
 > **INF-05/F2 — actualización 2026-11-03: VALIDADO EN DOCKER AISLADO; NO APROBADO PARA PRODUCCIÓN.** Tras corregir el fixture `Business` sin `slug` obligatorio y ajustar la cola simulada para excluir el job de contabilidad síncrona `PostSaleAccountingJob`, la validación funcional del archivo F2 quedó ejecutada en la base de pruebas aislada con **42 pruebas / 112 aserciones, todos OK**. El comando se ejecutó solo sobre MySQL/Redis del entorno aislado `comercios_rd_storage_test` / `REDIS_DB=15`, sin tocar producción ni ejecutar migraciones/seeders/builds en destino. El resultado confirma la integridad del flujo F2 en ese alcance, pero **no acredita producción** ni cierre total de DATA-02/lagacy; el SaaS sigue **NO APTO PARA PRODUCCIÓN**.
 
+> **INF-05/F2 — repetición funcional ampliada 2026-11-05: NO VALIDADO.** Con imagen reconstruida desde el lock actualizado e isolation guards PASS, el usuario ejecutó los ocho archivos funcionales autorizados: **175 pruebas, 1,416 aserciones, 2 errores de timeout**. Los 173 casos restantes pasaron; fallaron los datasets `same` y `conflict` de `PostSaleAccountingQueueTest::test_credit_checkouts_contend_on_a_real_mysql_request_lock`, ambos esperando el marcador `BLOCKED` del worker y terminando en `ProcessTimedOutException` tras 30 segundos. El dataset `unique-source` pasó. La salida no demuestra la causa raíz ni contiene una traza SQL del worker. El resultado 42/112 del 3 de noviembre corresponde al subconjunto F2 de Feature y no cubre estos escenarios de concurrencia; no acredita el conjunto requerido. Sin migraciones ni seeders; se iniciaron únicamente los servicios aislados test-mysql/test-redis y no se eliminaron contenedores/volúmenes huérfanos. F2 sigue **NO VALIDADO** y el SaaS **NO APTO PARA PRODUCCIÓN**.
+
+> **Estado 2026-11-21 — suite completa DATA-02 PASS (483 pruebas); NO APTO PARA PRODUCCIÓN.** Los timeouts `same`/`conflict` de F2 quedaron explicados y corregidos en el worker de prueba (commit `75a7415`): el 1205 llegaba envuelto en `DeadlockException` y el worker salía sin que el padre lo detectara. `MysqlTlsTest` pasó por separado el 2026-11-22: **16 pruebas / 123 aserciones**. Detalle en [Estado consolidado 2026-11-21](#estado-consolidado-2026-11-21).
+
 ### Seguimiento INF-06: hallazgos y prioridades
 
 La auditoría de seguridad fue de lectura; las correcciones se limitaron después
@@ -39,10 +43,10 @@ ausencia global de vulnerabilidades ni a inspección del runtime de DigitalOcean
 | SEC-02: sucursal inactiva reconstruida | MEDIO | `BranchAccessContext.php:134-141`, `CheckBranchActivation.php:40-47`, `AuthContextResolver.php:250-252`, `BindPosTenant.php:35-55`: limpiar la sesión no impide reconstruir contexto desde una membresía activa sin exigir sucursal activa. | PENDIENTE fuera de conteos ya validados. |
 | SEC-03: contrato de operaciones NULL incompleto | MEDIO | `BranchScope.php:47-54`, `TenantPolicy.php:79-87`, `TracksBranch.php:28-80`: excepciones compartidas/globales requieren contrato por entidad. No se demostró un IDOR interempresa general por NULL. | PENDIENTE de definición funcional; no cambiar permisos sin aprobación. |
 | DATA-03: costo histórico sustituido por costo actual | MEDIO | `SaleService` captura `unit_cost`, pero `AccountingService::createFromSale` recurre al producto mutable cuando el costo es cero/ausente. Un cero legítimo no significa dato faltante. | PENDIENTE; diseño de snapshot debajo, sin backfill ni cambio financiero en este lote. |
-| DEP-01: Symfony MIME vulnerable | MEDIO | `composer audit --locked`: `symfony/mime` 7.4.19, CVE-2026-45070 / PKSA-wtxr-p26d-nn42; versión corregida compatible 7.4.22+. No avisos ALTOS/CRÍTICOS ni paquetes abandonados en esa ejecución. | PENDIENTE de actualización y regresiones autorizadas; dependencias sin modificar. |
+| DEP-01: avisos de seguridad Symfony | MEDIO | El audit previo encontró avisos en Symfony; el 2026-11-05 se actualizaron de forma selectiva los seis paquetes afectados a 7.4.23 y dependencias transitivas necesarias, preservando Laravel 12.70.1. `composer validate` pasó y `composer audit --locked` reportó cero advisories. | CORREGIDO Y VALIDADO en el alcance del lock auditado. No sustituye el escaneo de la imagen o el análisis completo de dependencias del release. |
 | HTTP-01: encabezados duplicados | BAJO | Nginx y middleware `SecurityHeaders` declaran controles repetidos. No se observó bypass; pruebas Laravel no atraviesan Nginx. | PENDIENTE de aceptación HTTP real. |
 | INF-05/F1: fuente financiera confirmada editable | ALTO | Método, importes, fechas, origen contable y composición de líneas podían cambiar sin modificar el asiento original ya procesado. | CORREGIDO Y VALIDADO en el alcance Docker probado: 97/999, incluidas ocho contenciones MySQL; límites SQL y de aceptación descritos debajo. |
-| INF-05/F2: venta a crédito confirmada sin CxC válida | ALTO | Defecto original: observer omitía/capturaba errores de CxC; referencia textual sin unicidad. Corrección en código y fixture aislado con `slug` obligatorio; migración aplicada solo al esquema de pruebas y preflight SQL PASS. | VALIDADO EN DOCKER AISLADO: **42 pruebas / 112 aserciones, OK**. No acredita producción ni cierre de DATA-02/legado; el SaaS sigue **NO APTO PARA PRODUCCIÓN**. |
+| INF-05/F2: venta a crédito confirmada sin CxC válida | ALTO | Defecto original: observer omitía/capturaba errores de CxC; referencia textual sin unicidad. Corrección en código y fixture con `slug` obligatorio; migración aplicada solo al esquema de pruebas y preflight SQL PASS. El subconjunto F2 de 42/112 pasó el 2026-11-03; la ejecución ampliada de 175/1,416 del 2026-11-05 dejó dos errores de timeout en contención MySQL `same`/`conflict`. | **NO VALIDADO** hasta diagnosticar y resolver ambos escenarios y repetir con éxito el conjunto requerido. DATA-02/legado siguen pendientes; SaaS **NO APTO PARA PRODUCCIÓN**. |
 | INF-05: legado y supervisión sin cierre acreditado | MEDIO | Outbox no descubre ventas antiguas sin evento; el reconciliador conserva su límite 500/24 h. No hay evidencia suficiente de alertas/recuperación física en destino. | PENDIENTE; 53/768 de INF-04 no cierra el legado ni la operación. |
 
 ### INF-05/F1: integridad de la fuente confirmada
@@ -1648,7 +1652,7 @@ Próximas prioridades, mediante nueva autorización:
 El SaaS permanece **NO APTO PARA PRODUCCIÓN**. No se autoriza despliegue, nuevas
 migraciones ni escrituras de pruebas por la sola existencia de este informe.
 
-## Estado real del preflight INF-05/F2 (2026-11-03)
+## Estado real del preflight INF-05/F2 (2026-11-03; registro histórico)
 
 - runtime_preflight: PASS
 - 36 hashes verificados
@@ -1713,6 +1717,146 @@ Solicito autorización explícita para ejecutar exclusivamente estas pruebas en 
 
 > Informe de auditoría estática y seguimientos autorizados de SEC-01/DATA-01/INF-02/INF-04, con validación aislada aportada por el usuario. No constituye autorización para desplegar, modificar datos reales ni ejecutar nuevas pruebas con escritura.
 
+## Repetición funcional INF-05/F2 (2026-11-05)
+
+**Estado: NO VALIDADO.** El usuario autorizó la ejecución de los ocho archivos
+enumerados arriba. La imagen `comercios-rd-isolated-tests-phpunit:latest`
+construida desde el `composer.lock` actualizado fue
+`sha256:d433db5cb653ec000149816d07148bd2c72b5d5eea885f22f86ca64f87eb9814`.
+El helper de ejecución verificó antes del runner:
+
+- Red `comercios_rd_isolated_test_backend` interna, con exactamente dos
+  contenedores de servicio y sin puertos publicados.
+- MySQL de pruebas `comercios_rd_storage_test`, contenedor
+  `ef3c89813c5c598bc5a0d301ccedaa795a2048cfdc0990fefacd65f9747f3082`;
+  el volumen `comercios_rd_isolated_test_mysql` estaba adjunto solo a ese
+  contenedor.
+- Redis de pruebas, contenedor
+  `1a271a30edc664146eb70b144785d781c16e0802976cad83d9e56fadd5d5bb6e`.
+  Compose configura DB 15 y prefijo `comercios_rd_accounting_test_`.
+- Ambos contenedores estaban sanos y bajo el proyecto Compose aislado
+  `comercios-rd-isolated-tests`. Los `TestingDatabaseGuard` de la suite
+  también se ejecutaron al iniciar las aplicaciones de prueba.
+
+Se iniciaron únicamente `test-mysql` y `test-redis`, usando el volumen de
+pruebas existente. El runner con nombre
+`comercios-rd-f2-functional-20261105-0950` usó `--no-deps --pull never` y
+ejecutó PHPUnit 11.5.57 sobre PHP 8.3.36. Resultado: **175 pruebas,
+1,416 aserciones, 2 errores**; los otros 173 casos pasaron y no se reportaron
+fallos de aserción. No se ejecutaron migraciones ni seeders. Compose avisó
+sobre contenedores huérfanos preexistentes; no se usó `--remove-orphans` ni se
+eliminó ningún contenedor o volumen.
+
+Los dos errores son los datasets `#0 same` y `#1 conflict` de
+`PostSaleAccountingQueueTest::test_credit_checkouts_contend_on_a_real_mysql_request_lock`.
+En ambos, el worker
+`tests/Fixtures/sale-credit-concurrent-worker.php` no produjo `BLOCKED` dentro
+del límite existente de 30 s; PHPUnit recibió
+`Symfony\Component\Process\Exception\ProcessTimedOutException` desde
+`PostSaleAccountingQueueTest.php:1062`, invocado por la prueba en la línea 189.
+El caso `#2 unique-source` sí pasó. Este resultado confirma que los dos
+timeouts persisten tras las correcciones y la reconstrucción; **no identifica
+la causa raíz**. No se aumentó el timeout ni se repitió la prueba para ocultar
+el problema. La salida disponible no contiene el SQL/estado interno del worker
+al expirar.
+
+La ejecución confirma resultados positivos de los otros escenarios incluidos
+(contratos financieros, venta/CxC atómica, replay, rollback, aislamiento,
+recuperación/outbox, regresiones F1/INF-02/INF-04, devoluciones dentro del
+alcance y e-CF desactivado), pero no permite cerrar el requisito de
+concurrencia. El resultado previo **42/112** del 2026-11-03 fue un subconjunto
+de `SaleCreditIntegrityTest`; se conserva como evidencia de ese alcance,
+no como validación del conjunto ampliado.
+
+**Siguiente control:** preservar y recoger stdout/stderr completos del worker
+en cada etapa del protocolo (`READY`, solicitud de bloqueo, `BLOCKED` o fallo),
+junto con el estado de conexión MySQL/lock wait de la prueba aislada; explicar
+la diferencia entre `same`/`conflict` y `unique-source` antes de cambiar
+producción o límites. No ejecutar otra reproducción ni cambiar código sin
+autorización específica. F2 permanece **NO VALIDADO** y el SaaS **NO APTO PARA
+PRODUCCIÓN**.
+
+## Estado consolidado 2026-11-21
+
+**Estado: suite completa aislada PASS (483) y MysqlTlsTest PASS (16); SaaS NO APTO
+PARA PRODUCCIÓN.**
+
+**Incidente de origen.** Se ejecutó `migrate --force` sobre la base real
+`comercios_rd`. Se respaldó, se ensayó la restauración y se aplicaron medidas
+para que no pueda repetirse:
+
+- Medidas del guard 1, 2, 4 y 5 (`64eb858`): Artisan y PHPUnit bloquean el
+  acceso a bases fuera del runtime de pruebas autorizado.
+- Medida 3 (`0f0540d`): el destino se revalida al conectar y antes de DDL.
+- Medida 6 (fuera del repositorio): cuentas separadas `comercios_app` y
+  `comercios_migrator`; `comercios_user` bloqueada. Existe un script de
+  reversión junto al respaldo de la medida.
+- DATA-02 (`bde52ce`): los cobros de CxC se serializan y se impide el
+  sobrepago concurrente.
+
+**Corrección de F2 (`75a7415`).** En el worker
+`tests/Fixtures/sale-credit-concurrent-worker.php`, un 1205 dentro de una
+transacción anidada llegaba como `Illuminate\Database\DeadlockException` y no
+se reconocía. El worker terminaba con `exit(1)` y el padre, con stdin abierto,
+esperaba hasta el timeout de 30 s. En el mismo commit se ajustaron cuatro
+pruebas desactualizadas frente al guard y a la integridad financiera, sin
+cambiar código de aplicación.
+
+**Ejecución.** Imagen `comercios-rd-data02-phpunit:20261121b`
+(`sha256:64e06b5e17391df89521e705d2ea423c67b322c24ff624e46f14dd479fbe2ef3`),
+con su manifiesto de código verificado. Servicios DATA-02 aislados: red
+interna, sin puertos publicados, MySQL con UUID
+`93cfb391-e3d4-11f1-8d4b-062085bef20e`.
+
+| Bloque | Resultado |
+| --- | --- |
+| Unit | 125/125 |
+| Feature | 295; 2 omisiones esperadas de `LiveSmoke404Test` |
+| Concurrencia CxC (`ReceivablePaymentConcurrencyTest`) | 16/16 |
+| Cola contable (`PostSaleAccountingQueueTest` y relacionados) | 41/41 |
+| Portabilidad MySQL | 6/6 |
+| **Total** | **483 PASS** |
+
+Al terminar no quedaron datos residuales. Las migraciones de `comercios_rd`
+seguían iguales (72 registros, id máximo 72, batch 2, 76 tablas). No se
+ejecutaron migraciones ni seeders, y no se eliminaron contenedores ni
+volúmenes.
+
+**MysqlTlsTest (2026-11-22).** Se ejecutó con el perfil `tls-testing` y la misma
+imagen `20261121b`, en un proyecto propio (`comercios-rd-tls-20261121b`): red
+interna `comercios_rd_tls_20261121b_backend`, volumen de certificados
+desechables `comercios_rd_tls_20261121b_certs`, dos MySQL 8.4.13 con datos en
+tmpfs y sin puertos publicados.
+
+- Preflight PASS:
+  - guard;
+  - cifrado `TLS_AES_256_GCM_SHA384`;
+  - cuenta `comercios_storage_test@%`, con permisos limitados a
+    `comercios_rd_storage_test`;
+  - el servidor sin TLS es distinto y no tiene cifrado.
+- Resultado: **OK (16 tests, 123 assertions)**.
+- Al terminar se detuvieron los MySQL TLS sin borrar ningún recurso.
+- El inventario solo añadió los recursos de ese proyecto. F2 y `comercios_rd`
+  no cambiaron.
+
+**Pendientes y límites conocidos:**
+
+- El bloqueo de DDL del guard no cubre `TRUNCATE`.
+- `portability:backup` y `login:unlock --all` necesitan una cuenta distinta de
+  `comercios_app`.
+- Los checksums de la verificación de colación se guardaron en almacenamiento
+  temporal.
+- La copia externa del respaldo (USB) está aplazada.
+- Los cambios de despliegue en DigitalOcean, proxies y Redis TLS se incluyeron
+  en la imagen probada, pero no se ha hecho ningún despliegue ni prueba de
+  aceptación en destino.
+- Los demás hallazgos conservan el estado indicado en sus apartados. SEC-02
+  (`1138287`) y DATA-03 (`5edb751`) tienen commits posteriores que la tabla
+  de seguimiento todavía no refleja; quedan cubiertos por las 483 pruebas,
+  pero esa tabla no se ha actualizado.
+
+El SaaS permanece **NO APTO PARA PRODUCCIÓN**.
+
 ## Alcance, metodología y límites
 
 - Se audita el **árbol de trabajo actual**, incluidos cambios previos sin confirmar y archivos nuevos. Referencia base: `8f48a7ef797fc4ba51bfd10ced4cfebc6a86ff12`, rama `main`. El commit por sí solo no reproduce este árbol.
@@ -1738,7 +1882,7 @@ Severidades: **CRÍTICO**, **ALTO**, **MEDIO**, **BAJO**. Estados:
 
 Hay mejoras reales en el contexto de empresa, conteos por sucursal, validación contable y respaldos locales. La protección de portabilidad cuenta con ejecuciones aisladas específicas. SEC-01 y la carrera del mismo conteo DATA-01 recibieron correcciones autorizadas y validación dirigida: 36 pruebas y 258 aserciones, sin fallos. INF-02 se corrigió y validó con otra ejecución autorizada de 39 pruebas/399 aserciones, incluyendo Redis real y workers independientes. Ambas salidas Docker fueron aportadas por el usuario. Persisten defectos de pagos parciales o excesivos concurrentes, aceptación de sucursales desactivadas en otros módulos y ambigüedad de permisos sobre otras operaciones nuevas sin sucursal. La configuración Docker revisada sigue siendo local, no una arquitectura de producción ya validada.
 
-El bloqueo principal no es el número de pruebas: faltan invariantes de autorización e inventario en rutas específicas y evidencia de recuperación/operación en el destino. Composer detectó un aviso **MEDIO** en `symfony/mime`; npm no reportó avisos. No se confirmó una vulnerabilidad **CRÍTICA** en el alcance revisado; esto no certifica ausencia de otras vulnerabilidades ni cobertura exhaustiva.
+El bloqueo principal no es el número de pruebas: faltan invariantes de autorización e inventario en rutas específicas y evidencia de recuperación/operación en el destino. El `composer audit --locked` del 2026-11-05 quedó limpio después de actualizar Symfony; no se escaneó la imagen resultante. No se confirmó una vulnerabilidad **CRÍTICA** en el alcance revisado; esto no certifica ausencia de otras vulnerabilidades ni cobertura exhaustiva.
 
 Prioridad inmediata tras validar SEC-01/DATA-01/INF-02: cerrar las condiciones de carrera y atomicidad de pagos, definir/rechazar escrituras operacionales sin sucursal fuera de conteos y hacer efectiva la desactivación de sucursales en todos los módulos. También faltan TLS de todos los clientes, respaldos externos y configuración operativa de producción, incluida la supervisión y durabilidad reales de colas.
 
