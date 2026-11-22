@@ -97,6 +97,9 @@ return [
         'window' => 1, // tolerancia de ventanas TOTP
     ],
 
+    // Vacío = no confiar en X-Forwarded-*. En el borde: * o las IP del balanceador.
+    'trusted_proxies' => env('TRUSTED_PROXIES'),
+
     /*
     |--------------------------------------------------------------------------
     | RBAC — privilegios mínimos por rol (acciones lógicas)

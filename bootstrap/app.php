@@ -22,6 +22,17 @@ $app = Application::configure(basePath: dirname(__DIR__))
         health: '/up',
     )
     ->withMiddleware(function (Middleware $middleware): void {
+        $trusted = env('TRUSTED_PROXIES');
+        if (is_string($trusted) && trim($trusted) !== '') {
+            $trusted = trim($trusted);
+            $at = $trusted === '*'
+                ? '*'
+                : array_values(array_filter(array_map('trim', explode(',', $trusted))));
+            if ($at !== []) {
+                $middleware->trustProxies(at: $at);
+            }
+        }
+
         // Global: headers de seguridad en todas las respuestas
         $middleware->append(SecurityHeaders::class);
 
