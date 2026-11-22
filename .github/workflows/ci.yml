@@ -134,10 +134,10 @@ jobs:
       - name: Integration, MySQL TLS
         run: |
           $DC down -v
-          $DCT up -d --no-build tls-certificates
-          $DCT up -d --no-build --wait test-mysql-tls test-mysql-no-tls
-          $DCT run --rm -T phpunit-tls
-          $DCT run --rm -T phpunit-tls ./vendor/bin/phpunit --colors=never tests/Integration/MysqlTlsTest.php
+          $DCT run --rm -T tls-certificates
+          $DCT up -d --no-build --no-deps --wait test-mysql-tls test-mysql-no-tls
+          $DCT run --rm --no-deps -T phpunit-tls
+          $DCT run --rm --no-deps -T phpunit-tls ./vendor/bin/phpunit --colors=never tests/Integration/MysqlTlsTest.php
       - name: Limpieza del proyecto de CI
         if: always()
         run: |

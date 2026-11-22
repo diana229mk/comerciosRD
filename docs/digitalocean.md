@@ -135,12 +135,24 @@ Tras cualquier rollback: `docker compose ... ps`, `/up`, logs del worker (`docke
 
 ## Dependencias externas antes de staging
 
-- Cuenta de DigitalOcean con facturación.
-- Dos entornos separados: staging (Droplet + Managed MySQL propios) y producción.
-- Dominio y acceso a su DNS (`APP_DOMAIN` y un subdominio de staging).
-- Correo para ACME y un proveedor SMTP para notificaciones y restablecimiento de claves.
-- IP fija o rango de administración para el puerto 22.
-- Destino de backups fuera del Droplet (Spaces con cifrado) y la copia externa del respaldo actual.
+Lista exacta de lo que debe existir antes de V-02. Crea primero **staging**; producción repite la misma lista con recursos propios (nunca compartidos con staging).
+
+| # | Recurso | Staging | Producción | Configuración obligatoria |
+|---|---|---|---|---|
+| 1 | Cuenta de DigitalOcean | Una cuenta (o Team) con facturación y 2FA | La misma | 2FA activo en todos los miembros. |
+| 2 | Proyecto | `comerciosrd-staging` | `comerciosrd-prod` | Separa permisos y facturación. |
+| 3 | VPC | Una por entorno, misma región | Una por entorno | Droplet y base dentro de la misma VPC. |
+| 4 | Droplet | Ubuntu 24.04 LTS, 2 vCPU / 4 GB | Ubuntu 24.04 LTS, 2 vCPU / 4 GB o más | Clave SSH (sin contraseña), **Monitoring** activo, backups semanales del Droplet. |
+| 5 | Managed MySQL | 8.4, 1 nodo | 8.4; nodo en espera recomendado | Misma región y VPC. *Trusted sources*: solo el Droplet. Descarga la CA. |
+| 6 | Cloud Firewall | Asignado al Droplet | Asignado al Droplet | Entrada: 22 solo desde tu IP; 80 y 443 desde Internet. Nada más. |
+| 7 | Dominio y DNS | `staging.<dominio>` | `<dominio>` o `app.<dominio>` | Registro A hacia la IP pública del Droplet. Solo se cambia con autorización. |
+| 8 | Correo ACME | Un buzón real | El mismo | Avisos de Let's Encrypt (`ACME_EMAIL`). |
+| 9 | SMTP | Proveedor con dominio verificado (SPF y DKIM) | El mismo o uno propio | Host, puerto 587, usuario y contraseña; remitente `MAIL_FROM_ADDRESS`. |
+| 10 | IP de administración | Tu IP fija o rango | La misma | Para el firewall del puerto 22. |
+| 11 | Destino de backups fuera del Droplet | Spaces privado (staging) | Spaces privado y distinto | Sin acceso público; claves con permiso solo sobre ese bucket. |
+| 12 | Uptime check y alertas | `https://staging.<dominio>/up` | `https://<dominio>/up` | Alertas por correo; CPU > 80 %, memoria > 85 %, disco > 80 %. |
+
+Lo que necesito de ti para continuar (nunca contraseñas por chat): región elegida, nombre del dominio y subdominio de staging, IP de administración, correo ACME y proveedor SMTP. Las contraseñas de MySQL, Redis y `APP_KEY` las genera `init-do-env.sh` dentro del Droplet.
 
 ## Monitoreo y alertas
 
