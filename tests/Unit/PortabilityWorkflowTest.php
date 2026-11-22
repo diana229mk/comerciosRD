@@ -45,8 +45,10 @@ class PortabilityWorkflowTest extends TestCase
         $this->app = new Application($this->directory);
         $this->app->instance('config', new Repository([
             'app' => ['key' => 'unit-test-only', 'env' => 'testing'],
+            // Must satisfy DatabaseTargetPolicy: backup/restore validate the target before invoking clients.
             'database' => ['default' => 'mysql', 'connections' => ['mysql' => [
-                'database' => 'active_database', 'username' => 'unused', 'password' => '',
+                'driver' => 'mysql', 'host' => 'test-mysql', 'port' => '3306',
+                'database' => 'comercios_rd_storage_test', 'username' => 'comercios_storage_test', 'password' => 'unused',
             ]]],
             'filesystems' => ['default' => 'local'],
         ]));

@@ -53,6 +53,7 @@ class OrderQuoteFieldsTest extends TestCase
             'is_active' => true,
         ]);
 
+        $owner->businesses()->attach($business->id, ['role' => 'owner', 'is_active' => true]);
         $owner->forceFill(['current_business_id' => $business->id])->saveQuietly();
         $this->actingAs($owner);
         session(['current_business_id' => $business->id]);

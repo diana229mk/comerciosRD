@@ -6,6 +6,9 @@ use App\Services\SaleService;
 use App\Support\TestingDatabaseGuard;
 use Illuminate\Contracts\Console\Kernel;
 use Illuminate\Database\Events\QueryExecuted;
+use Illuminate\Database\Events\TransactionBeginning;
+use Illuminate\Database\Events\TransactionCommitted;
+use Illuminate\Database\Events\TransactionRolledBack;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Auth;
@@ -37,6 +40,49 @@ try {
     config(['database.connections.mysql.prefix' => $prefix, 'database.redis.options.prefix' => $prefix]);
     DB::purge('mysql');
     $app['redis']->purge('default');
+    $traceStart = hrtime(true);
+    $traceConnectionId = null;
+    $trace = static function (string $event, array $extra = []) use (&$traceConnectionId, $traceStart): void {
+        $now = hrtime(true);
+        fwrite(STDERR, 'F2_LOCK_TRACE '.json_encode([
+            'event' => $event,
+            'pid' => getmypid(),
+            'connection_id' => $traceConnectionId,
+            'transaction_level' => DB::transactionLevel(),
+            'monotonic_ns' => $now,
+            'elapsed_ms' => round(($now - $traceStart) / 1_000_000, 3),
+        ] + $extra, JSON_THROW_ON_ERROR).PHP_EOL);
+    };
+    $traceSql = static function (string $event, string $sql, array $extra = []) use ($trace): void {
+        $normalized = strtolower($sql);
+        $table = str_contains($normalized, 'sale_checkout_requests') ? 'sale_checkout_requests'
+            : (str_contains($normalized, 'receivables') ? 'receivables' : null);
+        if ($table === null) {
+            return;
+        }
+
+        $verb = strtoupper(strtok(ltrim($sql), " \t\n\r") ?: 'unknown');
+        $kind = str_contains($normalized, 'for update') ? 'lock_for_update'
+            : (in_array($verb, ['INSERT', 'UPDATE', 'DELETE'], true) ? 'write' : 'read');
+        $trace($event, ['table' => $table, 'verb' => $verb, 'kind' => $kind] + $extra);
+    };
+    DB::connection()->beforeExecuting(function (string $sql) use ($traceSql): void {
+        $traceSql('sql_begin', $sql);
+    });
+    DB::listen(function (QueryExecuted $query) use ($traceSql): void {
+        $traceSql('sql_complete', $query->sql, ['duration_ms' => $query->time]);
+    });
+    foreach ([
+        TransactionBeginning::class => 'transaction_begin',
+        TransactionCommitted::class => 'transaction_commit',
+        TransactionRolledBack::class => 'transaction_rollback',
+    ] as $eventClass => $eventName) {
+        $app['events']->listen($eventClass, function (object $event) use ($eventName, $trace): void {
+            if ($event->connectionName === 'mysql') {
+                $trace($eventName);
+            }
+        });
+    }
     $command = json_decode((string) getenv('F2_TEST_COMMAND'), true, flags: JSON_THROW_ON_ERROR);
     Auth::setUser(User::findOrFail($command['user_id']));
     app()->instance('currentBusinessId', $command['business_id']);
@@ -74,38 +120,68 @@ try {
         ]);
     };
     DB::statement('SET SESSION innodb_lock_wait_timeout = 1');
-    fwrite(STDOUT, 'READY:'.DB::selectOne('SELECT CONNECTION_ID() AS id')->id."\n");
+    $traceConnectionId = (int) DB::selectOne('SELECT CONNECTION_ID() AS id')->id;
+    $trace('worker_ready');
+    fwrite(STDOUT, 'READY:'.$traceConnectionId."\n");
     fflush(STDOUT);
-    if (trim((string) fgets(STDIN)) !== 'start') {
+    $signal = trim((string) fgets(STDIN));
+    $trace('start_received', ['signal' => $signal === 'start' ? 'start' : 'unexpected']);
+    if ($signal !== 'start') {
         throw new RuntimeException('Falta señal de inicio.');
     }
     if (in_array($mode, ['same', 'conflict', 'unique-source'], true)) {
+        $trace('wait_transaction_begin');
         DB::beginTransaction();
+        $trace('wait_transaction_active');
         try {
+            $trace('first_operation_begin');
             $operation();
+            $trace('first_operation_returned_unexpectedly');
             throw new RuntimeException('El checkout no esperó el bloqueo MySQL.');
-        } catch (QueryException $exception) {
-            if ((int) ($exception->errorInfo[1] ?? 0) !== 1205) {
+        } catch (Throwable $exception) {
+            $queryException = null;
+            for ($current = $exception; $current !== null; $current = $current->getPrevious()) {
+                if ($current instanceof QueryException) {
+                    $queryException = $current;
+                    break;
+                }
+            }
+            $mysqlCode = (int) ($queryException?->errorInfo[1] ?? 0);
+            $trace('first_operation_exception', [
+                'exception' => $exception::class,
+                'query_exception' => $queryException ? $queryException::class : null,
+                'sqlstate' => $queryException?->errorInfo[0] ?? null,
+                'mysql_code' => $mysqlCode,
+            ]);
+            if ($mysqlCode !== 1205) {
                 throw $exception;
             }
         } finally {
             while (DB::transactionLevel() > 0) {
+                $trace('worker_rollback_begin');
                 DB::rollBack();
+                $trace('worker_rollback_complete');
             }
         }
+        $trace('blocked_emitted');
         fwrite(STDOUT, "BLOCKED\n");
         fflush(STDOUT);
-        if (trim((string) fgets(STDIN)) !== 'retry') {
+        $signal = trim((string) fgets(STDIN));
+        $trace('retry_received', ['signal' => $signal === 'retry' ? 'retry' : 'unexpected']);
+        if ($signal !== 'retry') {
             throw new RuntimeException('Falta señal de reintento.');
         }
     }
     try {
+        $trace('retry_operation_begin');
         $sale = $operation();
+        $trace('retry_operation_returned');
         if (in_array($mode, ['conflict', 'unique-source'], true)) {
             throw new RuntimeException('Se reutilizó una clave incompatible.');
         }
         fwrite(STDOUT, ($mode === 'after-commit' ? 'CREDIT_COMMITTED:' : 'SALE:').$sale->id."\n");
         fflush(STDOUT);
+        $trace('sale_marker_emitted');
         if ($mode === 'after-commit') {
             fgets(STDIN);
         }
@@ -113,15 +189,44 @@ try {
         if ($mode !== 'conflict') {
             throw $exception;
         }
+        $trace('payload_conflict');
         fwrite(STDOUT, "CONFLICT\n");
     } catch (QueryException $exception) {
+        $trace('retry_query_exception', [
+            'sqlstate' => $exception->errorInfo[0] ?? null,
+            'mysql_code' => (int) ($exception->errorInfo[1] ?? 0),
+        ]);
         if ($mode !== 'unique-source' || (int) ($exception->errorInfo[1] ?? 0) !== 1062
             || ! str_contains($exception->getMessage(), 'receivables_business_sale_unique')) {
             throw $exception;
         }
+        $trace('unique_source_rejected');
         fwrite(STDOUT, "UNIQUE_REJECTED\n");
     }
+    $trace('worker_finished', ['result' => 'success']);
 } catch (Throwable $exception) {
-    fwrite(STDERR, $exception::class.': '.$exception->getMessage()."\n");
+    if (isset($trace)) {
+        $exceptionChain = [];
+        for ($current = $exception; $current !== null && count($exceptionChain) < 8; $current = $current->getPrevious()) {
+            $errorInfo = $current instanceof QueryException ? $current->errorInfo : null;
+            $exceptionChain[] = [
+                'exception' => $current::class,
+                'code' => $current->getCode(),
+                'sqlstate' => $errorInfo[0] ?? null,
+                'mysql_code' => isset($errorInfo[1]) ? (int) $errorInfo[1] : null,
+            ];
+        }
+        $trace('worker_exception', [
+            'exception_chain' => $exceptionChain,
+        ]);
+        $trace('worker_finished', ['result' => 'error']);
+    } else {
+        fwrite(STDERR, 'F2_LOCK_TRACE '.json_encode([
+            'event' => 'worker_bootstrap_exception',
+            'pid' => getmypid(),
+            'exception' => $exception::class,
+            'monotonic_ns' => hrtime(true),
+        ], JSON_THROW_ON_ERROR).PHP_EOL);
+    }
     exit(1);
 }

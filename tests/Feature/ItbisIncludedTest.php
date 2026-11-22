@@ -9,6 +9,7 @@ use App\Models\Sale;
 use App\Models\User;
 use App\Support\Itbis;
 use Illuminate\Foundation\Testing\DatabaseTransactions;
+use Illuminate\Support\Str;
 use Tests\TestCase;
 
 class ItbisIncludedTest extends TestCase
@@ -63,6 +64,7 @@ class ItbisIncludedTest extends TestCase
         ])->assertOk();
 
         $response = $this->postJson('/caja/'.$business->slug.'/api/checkout', [
+            'idempotency_key' => (string) Str::uuid(),
             'items' => [[
                 'product_id' => $product->id,
                 'qty' => 1,

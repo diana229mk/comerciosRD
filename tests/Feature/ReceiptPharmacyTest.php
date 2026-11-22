@@ -9,6 +9,7 @@ use App\Models\ProductBatch;
 use App\Models\Sale;
 use App\Models\SaleItem;
 use App\Models\SaleItemBatch;
+use App\Services\SaleFinancialIntegrity;
 use Illuminate\Foundation\Testing\DatabaseTransactions;
 use Illuminate\Support\Carbon;
 use Tests\TestCase;
@@ -47,8 +48,8 @@ class ReceiptPharmacyTest extends TestCase
             'expires_at' => now()->addDays(90)->toDateString(),
         ]);
 
-        // Venta
-        $sale = Sale::create([
+        // Venta completada: sus líneas solo pueden escribirse mientras se construye (integridad financiera).
+        $sale = new Sale([
             'business_id' => $business->id,
             'subtotal' => 12.5,
             'tax' => 0,
@@ -57,26 +58,26 @@ class ReceiptPharmacyTest extends TestCase
             'amount_paid' => 12.5,
             'status' => SaleStatus::Completada,
         ]);
+        app(SaleFinancialIntegrity::class)->construct($sale, function (Sale $sale) use ($business, $product, $batch): void {
+            $item = SaleItem::create([
+                'sale_id' => $sale->id,
+                'business_id' => $business->id,
+                'product_id' => $product->id,
+                'product_name' => $product->name,
+                'quantity' => 1,
+                'unit_price' => 12.5,
+                'unit_cost' => 5,
+            ]);
 
-        // Item
-        $item = SaleItem::create([
-            'sale_id' => $sale->id,
-            'business_id' => $business->id,
-            'product_id' => $product->id,
-            'product_name' => $product->name,
-            'quantity' => 1,
-            'unit_price' => 12.5,
-            'unit_cost' => 5,
-        ]);
-
-        // Asignación de lote (trazabilidad)
-        SaleItemBatch::create([
-            'sale_item_id' => $item->id,
-            'sale_id' => $sale->id,
-            'batch_id' => $batch->id,
-            'quantity' => 1,
-            'unit_cost' => 5,
-        ]);
+            // Asignación de lote (trazabilidad)
+            SaleItemBatch::create([
+                'sale_item_id' => $item->id,
+                'sale_id' => $sale->id,
+                'batch_id' => $batch->id,
+                'quantity' => 1,
+                'unit_cost' => 5,
+            ]);
+        });
 
         // Construir payload similar al controller y renderizar la vista directamente
         $batchesMap = SaleItemBatch::with('batch')
