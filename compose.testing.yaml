@@ -23,9 +23,8 @@ services:
       retries: 20
       start_period: 20s
 
+  # Always defined so other profiles can depend on it without validation errors
   test-redis:
-    profiles:
-      - accounting-testing
     image: redis:7.4-alpine
     restart: "no"
     command:
@@ -53,6 +52,7 @@ services:
     restart: "no"
     environment:
       APP_ENV: testing
+      COMERCIOS_TEST_RUNTIME: comercios-rd-isolated-tests/v1
       APP_DEBUG: "false"
       DB_CONNECTION: mysql
       DB_HOST: test-mysql
@@ -106,6 +106,7 @@ services:
     restart: "no"
     environment:
       APP_ENV: testing
+      COMERCIOS_TEST_RUNTIME: comercios-rd-isolated-tests/v1
       PORTABILITY_MYSQL_INTEGRATION: "1"
       PORTABILITY_TEST_MYSQL_HOST: test-mysql
       PORTABILITY_TEST_MYSQL_PASSWORD: ${COMERCIOS_TEST_MYSQL_ROOT_PASSWORD:?Set COMERCIOS_TEST_MYSQL_ROOT_PASSWORD}
@@ -205,6 +206,7 @@ services:
     restart: "no"
     environment:
       APP_ENV: testing
+      COMERCIOS_TEST_RUNTIME: comercios-rd-isolated-tests/v1
       APP_DEBUG: "false"
       DB_CONNECTION: mysql
       DB_HOST: test-mysql-tls

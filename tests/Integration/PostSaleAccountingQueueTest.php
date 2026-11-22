@@ -27,6 +27,10 @@ use App\Services\SaleCreditService;
 use App\Services\SaleFinancialIntegrity;
 use App\Services\SaleService;
 use App\Support\TestingDatabaseGuard;
+use Illuminate\Database\Events\QueryExecuted;
+use Illuminate\Database\Events\TransactionBeginning;
+use Illuminate\Database\Events\TransactionCommitted;
+use Illuminate\Database\Events\TransactionRolledBack;
 use Illuminate\Database\QueryException;
 use Illuminate\Queue\RedisQueue;
 use Illuminate\Support\Facades\DB;
@@ -53,6 +57,12 @@ class PostSaleAccountingQueueTest extends TestCase
     private string $defaultQueue = '';
 
     private ?RedisQueue $queue = null;
+
+    private int $creditTraceStart = 0;
+
+    private ?int $creditTraceConnectionId = null;
+
+    private ?Process $creditWorker = null;
 
     protected function setUp(): void
     {
@@ -115,7 +125,13 @@ class PostSaleAccountingQueueTest extends TestCase
         try {
             foreach ($this->workers as $worker) {
                 if ($worker->isRunning()) {
+                    if ($worker === $this->creditWorker && $this->creditTraceStart > 0) {
+                        $this->traceCredit('worker_stop_requested', $worker);
+                    }
                     $worker->stop(1);
+                    if ($worker === $this->creditWorker && $this->creditTraceStart > 0) {
+                        $this->traceCredit('worker_stopped', $worker, ['exit_code' => $worker->getExitCode()]);
+                    }
                 }
             }
             if ($this->createdTables !== []) {
@@ -175,23 +191,61 @@ class PostSaleAccountingQueueTest extends TestCase
     #[DataProvider('creditCompetitors')]
     public function test_credit_checkouts_contend_on_a_real_mysql_request_lock(string $mode): void
     {
+        $this->creditTraceStart = hrtime(true);
+        $this->creditTraceConnectionId = (int) DB::selectOne('SELECT CONNECTION_ID() AS id')->id;
+        $this->watchCreditQueries();
         $fixture = $this->saleContext();
         $command = $this->creditCommand($fixture);
         $input = new InputStream;
+        $this->traceCredit('parent_transaction_begin');
         DB::beginTransaction();
+        $this->traceCredit('parent_transaction_active');
         try {
             $sale = app(SaleService::class)->create($command);
+            $this->traceCredit('parent_sale_created');
             $worker = $this->startCreditWorker($command, $fixture, $mode, $input, $sale);
             $this->awaitMarker($worker, 'READY:');
             preg_match('/READY:(\d+)/', $worker->getOutput(), $connection);
+            $this->traceCredit('worker_ready', $worker, ['worker_connection_id' => (int) $connection[1]]);
             $this->assertNotSame((int) $connection[1], (int) DB::selectOne('SELECT CONNECTION_ID() AS id')->id);
+            $this->traceCredit('start_sent', $worker);
             $input->write("start\n");
-            $this->awaitMarker($worker, 'BLOCKED');
+            $this->traceCredit('waiting_for_blocked', $worker);
+            try {
+                $this->awaitMarker($worker, 'BLOCKED');
+                $this->traceCredit('blocked_observed', $worker);
+            } catch (\Throwable $exception) {
+                $workerTraceLines = array_values(array_filter(
+                    explode(PHP_EOL, $worker->getErrorOutput()),
+                    static fn (string $line): bool => str_starts_with($line, 'F2_LOCK_TRACE ')
+                ));
+                $workerTraceLineCount = count($workerTraceLines);
+                if ($workerTraceLineCount > 80) {
+                    $workerTraceLines = array_merge(
+                        array_slice($workerTraceLines, 0, 20),
+                        array_slice($workerTraceLines, -60)
+                    );
+                }
+                $this->traceCredit('blocked_wait_failed', $worker, [
+                    'exception' => $exception::class,
+                    'worker_running' => $worker->isRunning(),
+                    'worker_stdout' => trim($worker->getOutput()),
+                    'worker_trace_line_count' => $workerTraceLineCount,
+                    'worker_trace_truncated' => $workerTraceLineCount > 80,
+                    'worker_trace_lines' => $workerTraceLines,
+                ]);
+                throw $exception;
+            }
             $this->assertSame(0, $this->queue->size($this->salesQueue));
+            $this->traceCredit('parent_commit_begin', $worker);
             DB::commit();
+            $this->traceCredit('parent_commit_complete', $worker);
+            $this->traceCredit('retry_sent', $worker);
             $input->write("retry\n");
             $input->close();
-            $this->assertSame(0, $worker->wait(), $worker->getErrorOutput().$worker->getOutput());
+            $exitCode = $worker->wait();
+            $this->traceCredit('worker_finished', $worker, ['exit_code' => $exitCode]);
+            $this->assertSame(0, $exitCode, $worker->getErrorOutput().$worker->getOutput());
             $marker = match ($mode) {
                 'conflict' => 'CONFLICT',
                 'unique-source' => 'UNIQUE_REJECTED',
@@ -205,11 +259,15 @@ class PostSaleAccountingQueueTest extends TestCase
             $this->assertSame(1, (int) SalesDaily::withoutBusinessScope()->sole()->tickets);
             $this->runWorker('drain');
             $this->assertPostedOnce($sale);
+            $this->traceCredit('test_complete', $worker);
         } finally {
             while (DB::transactionLevel() > 0) {
+                $this->traceCredit('parent_rollback');
                 DB::rollBack();
+                $this->traceCredit('parent_rollback_complete');
             }
             $input->close();
+            $this->traceCredit('test_finally');
         }
     }
 
@@ -943,6 +1001,7 @@ class PostSaleAccountingQueueTest extends TestCase
 
     private function startCreditWorker(array $command, array $fixture, string $mode, InputStream $input, ?Sale $source = null): Process
     {
+        $this->traceCredit('worker_starting');
         $worker = new Process([PHP_BINARY, base_path('tests/Fixtures/sale-credit-concurrent-worker.php')], base_path(), [
             'F2_TEST_PREFIX' => $this->prefix, 'F2_TEST_MODE' => $mode,
             'F2_TEST_COMMAND' => json_encode($command, JSON_THROW_ON_ERROR),
@@ -955,8 +1014,60 @@ class PostSaleAccountingQueueTest extends TestCase
         ], $input, 30);
         $this->workers[] = $worker;
         $worker->start();
+        $this->creditWorker = $worker;
+        $this->traceCredit('worker_started', $worker);
 
         return $worker;
+    }
+
+    private function traceCredit(string $event, ?Process $worker = null, array $extra = []): void
+    {
+        $now = hrtime(true);
+        fwrite(STDERR, 'F2_LOCK_TRACE '.json_encode([
+            'event' => $event,
+            'pid' => getmypid(),
+            'worker_pid' => $worker?->getPid(),
+            'connection_id' => $this->creditTraceConnectionId,
+            'transaction_level' => DB::transactionLevel(),
+            'monotonic_ns' => $now,
+            'elapsed_ms' => round(($now - $this->creditTraceStart) / 1_000_000, 3),
+        ] + $extra, JSON_THROW_ON_ERROR).PHP_EOL);
+    }
+
+    private function watchCreditQueries(): void
+    {
+        DB::connection()->beforeExecuting(function (string $sql): void {
+            $this->traceCreditSql('sql_begin', $sql);
+        });
+        DB::listen(function (QueryExecuted $query): void {
+            $this->traceCreditSql('sql_complete', $query->sql, ['duration_ms' => $query->time]);
+        });
+        foreach ([
+            TransactionBeginning::class => 'transaction_begin',
+            TransactionCommitted::class => 'transaction_commit',
+            TransactionRolledBack::class => 'transaction_rollback',
+        ] as $eventClass => $eventName) {
+            $this->app['events']->listen($eventClass, function (object $event) use ($eventName): void {
+                if ($event->connectionName === 'mysql') {
+                    $this->traceCredit($eventName);
+                }
+            });
+        }
+    }
+
+    private function traceCreditSql(string $event, string $sql, array $extra = []): void
+    {
+        $normalized = strtolower($sql);
+        $table = str_contains($normalized, 'sale_checkout_requests') ? 'sale_checkout_requests'
+            : (str_contains($normalized, 'receivables') ? 'receivables' : null);
+        if ($table === null) {
+            return;
+        }
+
+        $verb = strtoupper(strtok(ltrim($sql), " \t\n\r") ?: 'unknown');
+        $kind = str_contains($normalized, 'for update') ? 'lock_for_update'
+            : (in_array($verb, ['INSERT', 'UPDATE', 'DELETE'], true) ? 'write' : 'read');
+        $this->traceCredit($event, null, ['table' => $table, 'verb' => $verb, 'kind' => $kind] + $extra);
     }
 
     private function cancelledFinancialSale(array $fixture, string $id): Sale

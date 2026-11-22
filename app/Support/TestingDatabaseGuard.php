@@ -8,7 +8,7 @@ use RuntimeException;
 
 class TestingDatabaseGuard
 {
-    private const DATABASE = 'comercios_rd_storage_test';
+    private const DATABASE = DatabaseTargetPolicy::TEST_DATABASE;
 
     private const DEVELOPMENT_DATABASE = 'comercios_rd';
 
@@ -32,6 +32,11 @@ class TestingDatabaseGuard
 
     public static function assertIsolated(Application $app): void
     {
+        // Pre-connection: runtime contract and effective target, before any PDO is opened.
+        TestRuntime::assertAuthorized();
+        DatabaseTargetPolicy::assertConfigurationNotCached($app);
+        DatabaseTargetPolicy::assertTestingConnection((array) config('database.connections.mysql'), 'mysql');
+
         $username = (string) config('database.connections.mysql.username');
         $password = (string) config('database.connections.mysql.password');
 
@@ -51,10 +56,12 @@ class TestingDatabaseGuard
         try {
             $connection = DB::connection('mysql');
             $identity = $connection->selectOne(
-                'SELECT DATABASE() AS database_name, @@hostname AS server, CURRENT_USER() AS account'
+                'SELECT DATABASE() AS database_name, @@hostname AS server, @@server_uuid AS server_uuid, CURRENT_USER() AS account'
             );
 
-            if ($identity?->database_name !== self::DATABASE) {
+            if ($identity?->database_name !== self::DATABASE
+                || trim((string) ($identity?->server_uuid ?? '')) === ''
+                || DatabaseTargetPolicy::isProtectedServer((string) $identity->server_uuid)) {
                 throw new RuntimeException;
             }
 
@@ -100,7 +107,7 @@ class TestingDatabaseGuard
     {
         $database = config('database.connections.'.config('database.default').'.database');
 
-        if ($database === self::DEVELOPMENT_DATABASE) {
+        if (in_array($database, [self::DEVELOPMENT_DATABASE, ...DatabaseTargetPolicy::PROTECTED_DATABASES], true)) {
             throw new RuntimeException(
                 'Migration refused: comercios_rd is protected from destructive migration commands.'
             );

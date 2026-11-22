@@ -11,6 +11,7 @@ use App\Models\InventoryMovement;
 use App\Models\Product;
 use App\Models\ProductVariant;
 use App\Models\Sale;
+use App\Scopes\BranchScope;
 use App\Services\AccountingOutboxService;
 use App\Services\CashSessionService;
 use App\Services\InventoryService;
@@ -131,7 +132,9 @@ class SaleObserver
     {
         app(SaleFinancialIntegrity::class)->assertBusiness((string) $sale->business_id);
         $sale->getConnection()->transaction(function () use ($sale, $skipInventory): void {
-            $locked = Sale::withoutBusinessScope()->where('business_id', $sale->business_id)
+            $locked = Sale::withoutBusinessScope()
+                ->withoutGlobalScope(BranchScope::class)
+                ->where('business_id', $sale->business_id)
                 ->whereKey($sale->id)->lockForUpdate()->firstOrFail();
             if (! $locked->isCompleted()) {
                 return;

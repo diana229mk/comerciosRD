@@ -13,6 +13,7 @@ use Illuminate\Validation\ValidationException;
 require dirname(__DIR__, 2).'/vendor/autoload.php';
 
 try {
+    require __DIR__.'/_guard.php';
     $prefix = getenv('F1_TEST_PREFIX');
     if (getenv('APP_ENV') !== 'testing' || getenv('ACCOUNTING_QUEUE_INTEGRATION') !== '1'
         || ! is_string($prefix) || preg_match('/^crd_accounting_test_[a-f0-9]{16}_$/D', $prefix) !== 1) {

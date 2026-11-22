@@ -5,6 +5,7 @@ namespace App\Services;
 use App\Jobs\PostSaleAccountingJob;
 use App\Models\AccountingOutbox;
 use App\Models\Sale;
+use App\Scopes\BranchScope;
 use App\Support\TenantContext;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -23,6 +24,7 @@ class AccountingOutboxService
 
         return TenantContext::run((string) $sale->business_id, function () use ($sale, $resumeSkipped): AccountingOutbox {
             if (! $sale->exists || ! Sale::withoutBusinessScope()
+                ->withoutGlobalScope(BranchScope::class)
                 ->where('business_id', $sale->business_id)->whereKey($sale->getKey())->exists()) {
                 throw new \RuntimeException('El evento requiere una venta persistida de la misma empresa.');
             }

@@ -9,6 +9,14 @@ DB_NAME=comercios_rd_storage_test
 DB_USER=comercios_test
 ENV_FILE="$ROOT/.env.testing"
 
+# Legado: el guard de pruebas solo acepta el MySQL de la red Docker aislada
+# (compose.testing.yaml); una base de pruebas en el MySQL del host no se usará.
+if [[ "${COMERCIOS_ALLOW_HOST_TEST_DB:-}" != "YES" ]]; then
+  echo "Bloqueado: este script usa root en el MySQL del host, donde vive comercios_rd." >&2
+  echo "Use el entorno Docker aislado. Para continuar de todos modos: COMERCIOS_ALLOW_HOST_TEST_DB=YES" >&2
+  exit 1
+fi
+
 if [[ "$(id -u)" -ne 0 ]]; then
   echo "Usa: sudo bash $0"
   echo "Eso pide la clave de Linux, no la de Filament."
@@ -60,4 +68,4 @@ chmod 600 "$ENV_FILE"
 chown "${SUDO_USER:-deleon}:${SUDO_USER:-deleon}" "$ENV_FILE"
 
 echo "Lista ${DB_NAME} en 3306. comercios_rd no se tocó."
-echo "Luego: sudo -u ${SUDO_USER:-deleon} env APP_ENV=testing php artisan migrate --force -C $ROOT"
+echo "No ejecute artisan en el host: las migraciones y pruebas solo se permiten en el entorno Docker aislado."

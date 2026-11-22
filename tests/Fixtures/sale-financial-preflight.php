@@ -8,6 +8,7 @@ use Illuminate\Support\Facades\Schema;
 require dirname(__DIR__, 2).'/vendor/autoload.php';
 
 try {
+    require __DIR__.'/_guard.php';
     if (getenv('APP_ENV') !== 'testing' || getenv('ACCOUNTING_QUEUE_INTEGRATION') !== '1'
         || getenv('INF05_F1_PREFLIGHT') !== '1') {
         throw new RuntimeException('Se requiere autorización del preflight F1 y el runner contable aislado.');

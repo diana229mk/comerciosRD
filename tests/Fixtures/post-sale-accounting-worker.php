@@ -12,6 +12,7 @@ use Illuminate\Support\Facades\DB;
 require dirname(__DIR__, 2).'/vendor/autoload.php';
 
 try {
+    require __DIR__.'/_guard.php';
     $prefix = getenv('QUEUE_TEST_PREFIX');
     $mode = getenv('QUEUE_TEST_MODE');
     if (getenv('APP_ENV') !== 'testing' || getenv('ACCOUNTING_QUEUE_INTEGRATION') !== '1'

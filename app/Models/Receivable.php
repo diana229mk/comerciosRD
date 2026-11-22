@@ -3,7 +3,7 @@
 namespace App\Models;
 
 use App\Database\ReceivableQueryBuilder;
-use App\Services\CashSessionService;
+use App\Services\ReceivablePaymentService;
 use App\Services\SaleCreditService;
 use App\Services\SaleReceivableIntegrity;
 use App\Traits\BelongsToBusiness;
@@ -134,7 +134,15 @@ class Receivable extends Model
 
             return;
         }
-        $paid = round((float) $this->payments()->sum('amount'), 2);
+        $gross = (float) $this->payments()->lockForUpdate()->sum('amount');
+        $reversed = (float) $this->payments()
+            ->join('receivable_payment_reversals as reversals', function ($join): void {
+                $join->on('reversals.receivable_payment_id', '=', 'receivable_payments.id')
+                    ->on('reversals.business_id', '=', 'receivable_payments.business_id');
+            })
+            ->lockForUpdate()
+            ->sum('receivable_payments.amount');
+        $paid = round(max(0, $gross - $reversed), 2);
         $amount = round((float) $this->amount, 2);
         $balance = round(max(0, $amount - $paid), 2);
 
@@ -158,7 +166,7 @@ class Receivable extends Model
     }
 
     /**
-     * Registra un cobro, actualiza estado y, si es efectivo, suma a la caja abierta.
+     * Registra un cobro de forma atómica (lockForUpdate) para evitar sobrepagos concurrentes (DATA-02).
      */
     public function registerPayment(
         float $amount,
@@ -167,47 +175,18 @@ class Receivable extends Model
         ?string $reference = null,
         ?string $notes = null,
         bool $updateCashSession = true,
+        ?string $requestKey = null,
     ): ReceivablePayment {
-        $amount = round($amount, 2);
-        if ($amount <= 0) {
-            throw new \InvalidArgumentException('El monto del cobro debe ser mayor que cero.');
-        }
-
-        $max = round((float) $this->balance, 2);
-        if ($max <= 0) {
-            throw new \RuntimeException('Esta cuenta ya está cobrada.');
-        }
-
-        if ($amount > $max + 0.001) {
-            throw new \InvalidArgumentException(
-                'El cobro (RD$ '.number_format($amount, 2).') supera el saldo pendiente (RD$ '.number_format($max, 2).').'
-            );
-        }
-
-        $payment = new ReceivablePayment([
-            'receivable_id' => $this->id,
-            'amount' => $amount,
-            'payment_method' => $paymentMethod,
-            'payment_date' => $paymentDate ?: now()->toDateString(),
-            'reference' => $reference,
-            'notes' => $notes,
-            'created_by' => auth()->id(),
-        ]);
-        $payment->business_id = $this->business_id;
-        $payment->save();
-
-        if ($updateCashSession && in_array(strtolower($paymentMethod), ['efectivo', 'cash'], true)) {
-            app(CashSessionService::class)->registerCashAmount(
-                (string) $this->business_id,
-                $amount,
-                now(),
-                auth()->id() ? (string) auth()->id() : null,
-            );
-        }
-
-        $this->refresh();
-
-        return $payment;
+        return app(ReceivablePaymentService::class)->collect(
+            receivable: $this,
+            amount: $amount,
+            paymentMethod: $paymentMethod,
+            paymentDate: $paymentDate,
+            reference: $reference,
+            notes: $notes,
+            requestKey: $requestKey,
+            updateCashSession: $updateCashSession,
+        );
     }
 
     protected static function booted(): void

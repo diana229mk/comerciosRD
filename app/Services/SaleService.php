@@ -13,10 +13,10 @@ use App\Models\PrescriptionItem;
 use App\Models\Product;
 use App\Models\ProductBatch;
 use App\Models\ProductVariant;
-use App\Models\Receivable;
 use App\Models\Sale;
 use App\Models\SaleItem;
 use App\Models\SaleItemBatch;
+use App\Models\SaleReturnOperation;
 use App\Models\User;
 use App\Observers\SaleObserver;
 use App\Support\BusinessRole;
@@ -24,7 +24,8 @@ use App\Support\EcfFeature;
 use App\Support\Itbis;
 use App\Support\ScaleMetrics;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Str;
+use Illuminate\Validation\ValidationException;
 use InvalidArgumentException;
 use RuntimeException;
 
@@ -538,13 +539,18 @@ class SaleService implements RecordsSale
      *    devuelve como resumen (el reembolso real se hace en el terminal).
      *
      * @param  array<string, float|int|string>  $quantities
-     * @return array{movements: list<InventoryMovement>, refund_amount: float, refund_channel: string, refund_note: ?string}
+     * @return array{
+     *     movements:list<InventoryMovement>,refund_amount:float,refund_channel:string,refund_note:?string,
+     *     credit_note:?object,credit_note_error:?string,credit_note_status:string,refund_status:string,
+     *     operation:SaleReturnOperation
+     * }
      */
     public function returnFromAllocations(
         Sale $sale,
         array $quantities,
         bool $applyRefund = true,
         ?bool $issueCreditNote = null,
+        ?string $requestKey = null,
     ): array {
         $sale->assertBelongsToCurrentBusiness();
 
@@ -571,8 +577,24 @@ class SaleService implements RecordsSale
         if ($normalized === []) {
             throw new InvalidArgumentException('Debes indicar al menos una cantidad a devolver.');
         }
+        ksort($normalized);
+        $requestKey = $this->normalizeReturnRequestKey($requestKey);
+        $payloadHash = hash('sha256', json_encode([
+            'business_id' => (string) $sale->business_id,
+            'sale_id' => (string) $sale->id,
+            'allocation_quantities' => $normalized,
+            'apply_refund' => $applyRefund,
+            'issue_credit_note' => $issueCreditNote,
+        ], JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE));
 
-        return DB::transaction(function () use ($sale, $normalized, $applyRefund, $issueCreditNote): array {
+        return DB::transaction(function () use (
+            $sale,
+            $normalized,
+            $applyRefund,
+            $issueCreditNote,
+            $requestKey,
+            $payloadHash,
+        ): array {
             $lockedSale = Sale::withoutBusinessScope()
                 ->where('business_id', $sale->business_id)
                 ->whereKey($sale->id)
@@ -580,6 +602,21 @@ class SaleService implements RecordsSale
                 ->firstOrFail();
             if (! $lockedSale->isCompleted()) {
                 throw new RuntimeException('Solo se pueden devolver productos de ventas completadas.');
+            }
+
+            $existingOperation = SaleReturnOperation::withoutBusinessScope()
+                ->where('business_id', $lockedSale->business_id)
+                ->where('request_key', $requestKey)
+                ->lockForUpdate()
+                ->first();
+            if ($existingOperation) {
+                if (! hash_equals((string) $existingOperation->payload_hash, $payloadHash)) {
+                    throw ValidationException::withMessages([
+                        'request_key' => 'La clave de devolución ya fue utilizada con otros datos.',
+                    ]);
+                }
+
+                return $this->returnOperationResult($existingOperation);
             }
 
             $allocations = SaleItemBatch::withoutBusinessScope()
@@ -648,7 +685,34 @@ class SaleService implements RecordsSale
                 throw new RuntimeException('El reembolso acumulado no puede superar el monto pagado.');
             }
 
+            $business = $lockedSale->business ?: Business::query()->find($lockedSale->business_id);
+            $shouldIssue = $issueCreditNote === null
+                ? null
+                : EcfFeature::enabled() && $issueCreditNote;
+            if ($shouldIssue === null) {
+                $shouldIssue = EcfFeature::enabled() && $business
+                    ? ((bool) ($business->settings['ecf']['auto_credit_note_on_return'] ?? false))
+                    : false;
+            }
+
+            $operation = new SaleReturnOperation([
+                'sale_id' => $lockedSale->id,
+                'request_key' => $requestKey,
+                'payload_hash' => $payloadHash,
+                'allocation_quantities' => $normalized,
+                'refund_amount' => $applyRefund ? $refundAmount : 0,
+                'refund_channel' => 'none',
+                'refund_status' => 'none',
+                'ecf_requested' => $shouldIssue,
+                'ecf_status' => $shouldIssue ? 'pending' : 'not_requested',
+                'ecf_available_at' => $shouldIssue ? now() : null,
+                'created_by' => auth()->id(),
+            ]);
+            $operation->business_id = $lockedSale->business_id;
+            $operation->saveQuietly();
+
             $movements = [];
+            $inventoryCost = 0.0;
 
             foreach ($requestedAllocations as $alloc) {
                 $requested = $normalized[(string) $alloc->id];
@@ -694,7 +758,9 @@ class SaleService implements RecordsSale
                 ]);
                 $movement->business_id = $sale->business_id;
                 $movement->batch_id = $batch->id;
+                $movement->sale_return_operation_id = $operation->id;
                 $movement->save();
+                $inventoryCost += round((float) ($batch->cost ?? $product->cost) * $requested, 2);
 
                 $alloc->forceFill([
                     'returned_quantity' => round((float) $alloc->returned_quantity + $requested, 3),
@@ -711,45 +777,62 @@ class SaleService implements RecordsSale
             $refundNote = null;
 
             if ($applyRefund && $refundAmount > 0) {
-                [$refundChannel, $refundNote] = $this->applyRefund($lockedSale, $refundAmount);
+                [$refundChannel, $refundNote] = $this->applyRefund($lockedSale, $refundAmount, $operation);
             }
 
-            // Nota de Crédito e-CF (tipo 34) — si el negocio la habilita.
-            $creditNote = null;
-            $creditNoteError = null;
-            $shouldIssue = EcfFeature::enabled() && $issueCreditNote;
-            if ($shouldIssue === null) {
-                $business = $sale->business ?: Business::query()->find($sale->business_id);
-                $shouldIssue = EcfFeature::enabled() && $business
-                    ? ((bool) ($business->settings['ecf']['auto_credit_note_on_return'] ?? false))
-                    : false;
-            }
-
-            if ($shouldIssue) {
-                try {
-                    $creditNote = EcfService::createCreditNoteForReturn(
-                        sale: $sale,
-                        allocationQuantities: $normalized,
-                        modificationCode: 3, // Devolución de mercancía
-                    );
-                } catch (\Throwable $e) {
-                    $creditNoteError = $e->getMessage();
-                    Log::warning('Devolución: no se pudo emitir Nota de Crédito e-CF', [
-                        'sale_id' => $sale->id,
-                        'error' => $e->getMessage(),
-                    ]);
-                }
-            }
-
-            return [
-                'movements' => $movements,
-                'refund_amount' => $refundAmount,
+            $taxAmount = $saleTotal > 0
+                ? round((float) $lockedSale->tax * ($refundAmount / $saleTotal), 2)
+                : 0.0;
+            $operation->forceFill([
                 'refund_channel' => $refundChannel,
                 'refund_note' => $refundNote,
-                'credit_note' => $creditNote,
-                'credit_note_error' => $creditNoteError,
-            ];
+                'tax_amount' => $applyRefund ? $taxAmount : 0,
+                'inventory_cost' => round($inventoryCost, 2),
+            ])->saveQuietly();
+
+            if ($refundAmount > 0 || $inventoryCost > 0) {
+                AccountingService::createFromSaleReturn($operation, $lockedSale);
+            }
+
+            return $this->returnOperationResult($operation->fresh());
         });
+    }
+
+    /**
+     * @return array{
+     *     movements:list<InventoryMovement>,refund_amount:float,refund_channel:string,refund_note:?string,
+     *     credit_note:?object,credit_note_error:?string,credit_note_status:string,refund_status:string,
+     *     operation:SaleReturnOperation
+     * }
+     */
+    private function returnOperationResult(SaleReturnOperation $operation): array
+    {
+        $operation->loadMissing(['electronicInvoice', 'inventoryMovements']);
+
+        return [
+            'movements' => $operation->inventoryMovements->all(),
+            'refund_amount' => (float) $operation->refund_amount,
+            'refund_channel' => (string) $operation->refund_channel,
+            'refund_note' => $operation->refund_note,
+            'credit_note' => $operation->electronicInvoice,
+            'credit_note_error' => $operation->ecf_last_error,
+            'credit_note_status' => (string) $operation->ecf_status,
+            'refund_status' => (string) $operation->refund_status,
+            'operation' => $operation,
+        ];
+    }
+
+    private function normalizeReturnRequestKey(?string $requestKey): string
+    {
+        $requestKey = trim((string) $requestKey);
+        if ($requestKey === '') {
+            return (string) Str::uuid();
+        }
+        if (strlen($requestKey) > 100 || ! preg_match('/\A[\x21-\x7E]+\z/', $requestKey)) {
+            throw new InvalidArgumentException('La clave de devolución no es válida.');
+        }
+
+        return $requestKey;
     }
 
     public function canReturn(Sale $sale, ?User $user = null): bool
@@ -767,92 +850,96 @@ class SaleService implements RecordsSale
     }
 
     /**
-     * Aplica el reembolso al canal correcto según método de pago:
-     *  - Efectivo → resta de caja abierta (si existe).
-     *  - Crédito/fiado → reduce el balance de la CxC de la venta.
-     *  - Otros (tarjeta/transferencia) → no aplica automáticamente.
-     *
-     * @return array{0:string,1:?string} [canal, nota]
+     * @return array{0:string,1:?string}
      */
-    protected function applyRefund(Sale $sale, float $amount): array
+    protected function applyRefund(Sale $sale, float $amount, SaleReturnOperation $operation): array
     {
         $method = $sale->payment_method;
-        if ($method instanceof PaymentMethod) {
-            $methodKey = $method->value;
-        } else {
-            $methodKey = (string) $method;
-        }
+        $methodKey = $method instanceof PaymentMethod ? $method->value : (string) $method;
         $normalized = PaymentMethod::normalize($methodKey);
+        $methodKey = $normalized->value;
 
-        // Efectivo → caja
         if (in_array($normalized, [PaymentMethod::Efectivo, PaymentMethod::Cash], true)) {
-            try {
-                $reversed = app(CashSessionService::class)
-                    ->reverseCashAmount((string) $sale->business_id, $amount);
+            $session = app(CashSessionService::class)->findOpenSessionForMovement(
+                (string) $sale->business_id,
+                auth()->id() ? (string) auth()->id() : null,
+                now(),
+            );
+            if ($session) {
+                app(CashSessionService::class)->recordMovementForSession(
+                    $session,
+                    (string) $sale->business_id,
+                    'sale_return_refund',
+                    (string) $operation->id,
+                    'out',
+                    SaleCreditService::cents(number_format($amount, 2, '.', '')),
+                    auth()->id() ? (string) auth()->id() : null,
+                );
 
-                if (! $reversed) {
-                    return [
-                        'cash_failed',
-                        'No había caja abierta — registra el reembolso manualmente: RD$ '.number_format($amount, 2),
-                    ];
-                }
+                $operation->forceFill([
+                    'refund_status' => 'settled',
+                    'refund_method' => 'efectivo',
+                    'refund_cash_session_id' => $session->id,
+                    'refund_due_amount' => 0,
+                    'refund_note' => 'Reembolso de efectivo registrado en la caja abierta.',
+                ])->saveQuietly();
 
-                return ['cash', 'Reembolso restado de la caja abierta: RD$ '.number_format($amount, 2)];
-            } catch (\Throwable $e) {
-                Log::warning('Devolución: no se pudo restar de caja', [
-                    'sale_id' => $sale->id,
-                    'error' => $e->getMessage(),
-                ]);
-
-                return ['cash_failed', 'No había caja abierta — registra el reembolso manualmente: RD$ '.number_format($amount, 2)];
-            }
-        }
-
-        // Fiado / crédito → CxC
-        if ($normalized->isCredit()) {
-            if ((int) $sale->credit_version === 1) {
-                $receivable = app(SaleCreditService::class)->refund($sale, number_format($amount, 2, '.', ''));
-                $extra = (float) $receivable->paid_amount > (float) $receivable->amount
-                    ? ' — el cliente ya había pagado más de lo que quedó, verifica reembolso.' : '';
-
-                return ['receivable', 'CxC reducida en RD$ '.number_format($amount, 2).$extra];
-            }
-            $saleNumber = $sale->sale_number ?: $sale->number ?: (string) $sale->id;
-            $reference = 'Venta '.$saleNumber;
-
-            $receivable = Receivable::withoutBusinessScope()
-                ->where('business_id', $sale->business_id)
-                ->where('reference', $reference)
-                ->first();
-
-            if (! $receivable) {
-                return ['credit_no_receivable', 'No se encontró la CxC de esta venta; ajusta manualmente: RD$ '.number_format($amount, 2)];
+                return ['cash', 'Reembolso registrado en caja: RD$ '.number_format($amount, 2)];
             }
 
-            $currentAmount = (float) $receivable->amount;
-            $paid = (float) $receivable->paid_amount;
-
-            // Reducir el total de la CxC. Si ya se pagó más de lo que queda, el excedente
-            // representa dinero que debe reembolsarse (no lo tocamos automáticamente).
-            $newAmount = round(max(0, $currentAmount - $amount), 2);
-            $newBalance = round(max(0, $newAmount - $paid), 2);
-
-            $receivable->forceFill([
-                'amount' => $newAmount,
-                'balance' => $newBalance,
-                'notes' => trim(($receivable->notes ?: '')."\nDevolución: RD$ ".number_format($amount, 2).' el '.now()->format('d/m/Y H:i')),
+            $operation->forceFill([
+                'refund_status' => 'pending',
+                'refund_method' => 'efectivo',
+                'refund_due_amount' => $amount,
+                'refund_note' => 'Reembolso pendiente; requiere una caja abierta para liquidarse.',
             ])->saveQuietly();
-            $receivable->refreshPaymentStatus();
 
-            $extra = $paid > $newAmount
-                ? ' — el cliente ya había pagado más de lo que quedó, verifica reembolso.'
-                : '';
-
-            return ['receivable', 'CxC reducida en RD$ '.number_format($amount, 2).$extra];
+            return ['cash_pending', 'Reembolso pendiente; requiere caja abierta: RD$ '.number_format($amount, 2)];
         }
 
-        // Tarjeta / transferencia → no automático
-        return ['manual', 'Método '.strtoupper($methodKey).': procesa el reembolso en el terminal (RD$ '.number_format($amount, 2).').'];
+        if ($normalized->isCredit()) {
+            if ((int) $sale->credit_version !== 1) {
+                throw new RuntimeException('La devolución de crédito requiere una CxC vinculada verificable.');
+            }
+            $receivable = app(SaleCreditService::class)
+                ->refund($sale, number_format($amount, 2, '.', ''));
+            $paidCents = SaleCreditService::cents($receivable->paid_amount);
+            $balanceCents = SaleCreditService::cents($receivable->amount);
+            $previousDue = DB::table('sale_return_operations')
+                ->where('business_id', $sale->business_id)
+                ->where('sale_id', $sale->id)
+                ->where('refund_channel', 'receivable')
+                ->where('id', '<>', $operation->id)
+                ->sum('refund_due_amount');
+            $newDueCents = min(
+                SaleCreditService::cents(number_format($amount, 2, '.', '')),
+                max(0, $paidCents - $balanceCents - SaleCreditService::cents($previousDue)),
+            );
+            $note = 'CxC reducida en RD$ '.number_format($amount, 2);
+            if ($newDueCents > 0) {
+                $note .= ' · Reembolso pendiente al cliente: RD$ '.number_format($newDueCents / 100, 2);
+            }
+            $operation->forceFill([
+                'refund_status' => $newDueCents > 0 ? 'pending' : 'settled',
+                'refund_method' => $newDueCents > 0 ? 'efectivo' : null,
+                'refund_due_amount' => SaleCreditService::decimal($newDueCents),
+                'refund_note' => $note,
+            ])->saveQuietly();
+
+            return ['receivable', $note];
+        }
+
+        $operation->forceFill([
+            'refund_status' => 'pending',
+            'refund_method' => $methodKey,
+            'refund_due_amount' => $amount,
+            'refund_note' => 'Reembolso pendiente de liquidación por '.$methodKey.'.',
+        ])->saveQuietly();
+
+        return [
+            'manual_pending',
+            'Reembolso pendiente de liquidación por '.$methodKey.': RD$ '.number_format($amount, 2),
+        ];
     }
 
     /**
@@ -874,6 +961,14 @@ class SaleService implements RecordsSale
                 ->firstOrFail();
             if (! $sale->isCancellable()) {
                 throw new RuntimeException('Solo se pueden anular ventas completadas.');
+            }
+            if (InventoryMovement::withoutBusinessScope()
+                ->where('business_id', $sale->business_id)
+                ->where('reference_type', Sale::class)
+                ->where('reference_id', $sale->id)
+                ->where('type', InventoryMovement::TYPE_RETURN_IN)
+                ->exists()) {
+                throw new RuntimeException('No se puede anular una venta que ya tiene devoluciones registradas.');
             }
 
             $sale->load('items');

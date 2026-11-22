@@ -43,8 +43,16 @@ class SecurityPreflight extends Command
             $violations[] = 'ECF_ENABLED=true no habilita e-CF: falta aprobación de validación XAdES/DGII en el código.';
         }
 
-        if (blank(config('app.key'))) {
+        $appKey = (string) config('app.key');
+        if (blank($appKey)) {
             $violations[] = 'APP_KEY está vacía. Genera una con `php artisan key:generate` y ¡NO la rotes después!';
+        } elseif ($isProd && (str_contains($appKey, 'REPLACE') || strlen($appKey) < 20)) {
+            $violations[] = 'APP_KEY de producción sigue siendo un placeholder o es demasiado corta.';
+        }
+
+        $databaseName = (string) config('database.connections.mysql.database');
+        if ($isProd && in_array($databaseName, ['comercios_rd_storage_test', 'comercios_rd_docker_test', 'laravel'], true)) {
+            $violations[] = "DB_DATABASE={$databaseName} es una base de pruebas o de plantilla. Producción necesita su propia base.";
         }
 
         if ($isProd && ! config('security.two_factor.enabled')) {
@@ -76,6 +84,11 @@ class SecurityPreflight extends Command
         }
 
         $appUrl = (string) config('app.url');
+        $trustedProxies = trim((string) config('security.trusted_proxies', ''));
+        if ($isProd && str_starts_with($appUrl, 'https://') && $trustedProxies === '') {
+            $violations[] = 'TRUSTED_PROXIES está vacío. Detrás del balanceador la app no ve HTTPS ni la IP real.';
+        }
+
         if ($isProd && str_starts_with($appUrl, 'https://') && ! config('session.secure')) {
             $violations[] = 'SESSION_SECURE_COOKIE debe ser true cuando APP_URL usa https://.';
         }
@@ -138,11 +151,30 @@ class SecurityPreflight extends Command
             $violations[] = 'PORTABILITY_BACKUP_ENABLED=false. Debe existir una ruta de backup operativa antes de producción.';
         }
 
-        if ($isProd && (
-            config('filesystems.default') === 's3'
-            || config('filesystems.disks.private.driver', 'local') === 's3'
-        )) {
-            $violations[] = 'El backup portability local no incluye buckets S3/Spaces; verifica una estrategia externa de respaldo y restauración de objetos antes del deploy.';
+        $objectDisks = array_values(array_filter([
+            config('filesystems.default') === 's3' ? 'default' : null,
+            config('filesystems.disks.private.driver', 'local') === 's3' ? 'private' : null,
+            config('filesystems.disks.public.driver', 'local') === 's3' ? 'public' : null,
+        ]));
+        if ($isProd && $objectDisks !== [] && ! config('portability.object_backup_verified')) {
+            $violations[] = 'Hay discos S3/Spaces ('.implode(', ', $objectDisks).') y PORTABILITY_OBJECT_BACKUP_VERIFIED no está activo. El backup local no copia objetos: prueba la restauración del bucket y solo entonces activa esa bandera.';
+        }
+
+        if ($isProd
+            && config('filesystems.disks.public.driver') === 's3'
+            && config('filesystems.disks.private.driver') === 's3'
+            && filled(config('filesystems.disks.public.bucket'))
+            && config('filesystems.disks.public.bucket') === config('filesystems.disks.private.bucket')
+        ) {
+            $violations[] = 'El bucket público de imágenes y el bucket privado de documentos no pueden ser el mismo.';
+        }
+
+        if ($isProd && (int) config('scale.target_concurrent_users', 1) >= 1000) {
+            $publicDriver = (string) config('filesystems.disks.public.driver', 'local');
+            $privateDriver = (string) config('filesystems.disks.private.driver', 'local');
+            if ($publicDriver === 'local' || $privateDriver === 'local') {
+                $warnings[] = 'Los archivos locales viven en un solo disco. Antes de un segundo servidor web, pásalos a almacenamiento compartido.';
+            }
         }
 
         foreach ($warnings as $w) {

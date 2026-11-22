@@ -2,12 +2,15 @@
 
 namespace App\Services;
 
+use App\Support\DatabaseConnectionGuard;
 use Illuminate\Database\Connectors\MySqlConnector;
 
 class VerifiedMysqlConnector extends MySqlConnector
 {
     public function connect(array $config)
     {
+        DatabaseConnectionGuard::authorizeConnect($config);
+
         $config['options'] = array_replace($config['options'] ?? [], MysqlTlsPolicy::pdoOptions($config));
 
         return parent::connect($config);

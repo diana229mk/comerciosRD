@@ -7,6 +7,7 @@ use Illuminate\Support\Facades\Schema;
 require dirname(__DIR__, 2).'/vendor/autoload.php';
 
 try {
+    require __DIR__.'/_guard.php';
     if (getenv('APP_ENV') !== 'testing' || getenv('ACCOUNTING_QUEUE_INTEGRATION') !== '1'
         || ($argv[1] ?? '') !== '--apply') {
         throw new RuntimeException('La migración requiere el runner aislado y autorización explícita mediante --apply.');

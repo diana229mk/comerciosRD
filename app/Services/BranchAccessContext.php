@@ -135,10 +135,11 @@ class BranchAccessContext
             $branchExists = \App\Models\Branch::withoutBusinessScope()
                 ->where('business_id', $businessId)
                 ->whereKey($branchIdToValidate)
+                ->where('is_active', true)
                 ->exists();
 
             if (! $branchExists) {
-                throw new AuthorizationException('La sucursal solicitada no pertenece al negocio.');
+                throw new AuthorizationException('La sucursal solicitada no pertenece al negocio o está inactiva.');
             }
         }
 

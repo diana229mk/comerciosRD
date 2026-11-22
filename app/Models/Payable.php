@@ -100,7 +100,7 @@ class Payable extends Model
     }
 
     /**
-     * Registra un pago y actualiza el estado de la cuenta.
+     * Registra un pago de forma atómica (lockForUpdate) para evitar sobrepagos concurrentes (DATA-02).
      */
     public function registerPayment(
         float $amount,
@@ -114,32 +114,39 @@ class Payable extends Model
             throw new \InvalidArgumentException('El monto del pago debe ser mayor que cero.');
         }
 
-        $max = round((float) $this->balance, 2);
-        if ($max <= 0) {
-            throw new \RuntimeException('Esta cuenta ya está pagada.');
-        }
+        return $this->getConnection()->transaction(function () use ($amount, $paymentMethod, $paymentDate, $reference, $notes) {
+            /** @var self $locked */
+            $locked = static::query()->whereKey($this->getKey())->lockForUpdate()->firstOrFail();
 
-        if ($amount > $max + 0.001) {
-            throw new \InvalidArgumentException(
-                'El pago (RD$ '.number_format($amount, 2).') supera el saldo pendiente (RD$ '.number_format($max, 2).').'
-            );
-        }
+            $max = round((float) $locked->balance, 2);
+            if ($max <= 0) {
+                throw new \RuntimeException('Esta cuenta ya está pagada.');
+            }
 
-        $payment = new PayablePayment([
-            'payable_id' => $this->id,
-            'amount' => $amount,
-            'payment_method' => $paymentMethod,
-            'payment_date' => $paymentDate ?: now()->toDateString(),
-            'reference' => $reference,
-            'notes' => $notes,
-            'created_by' => auth()->id(),
-        ]);
-        $payment->business_id = $this->business_id;
-        $payment->save();
+            if ($amount > $max + 0.001) {
+                throw new \InvalidArgumentException(
+                    'El pago (RD$ '.number_format($amount, 2).') supera el saldo pendiente (RD$ '.number_format($max, 2).').'
+                );
+            }
 
-        $this->refresh();
+            $payment = new PayablePayment([
+                'payable_id' => $locked->id,
+                'amount' => $amount,
+                'payment_method' => $paymentMethod,
+                'payment_date' => $paymentDate ?: now()->toDateString(),
+                'reference' => $reference,
+                'notes' => $notes,
+                'created_by' => auth()->id(),
+            ]);
+            $payment->business_id = $locked->business_id;
+            $payment->save();
 
-        return $payment;
+            $locked->refresh();
+            $this->setRawAttributes($locked->getAttributes());
+            $this->syncOriginal();
+
+            return $payment;
+        });
     }
 
     public function invoiceUrl(): ?string

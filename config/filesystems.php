@@ -54,10 +54,16 @@ return [
         ],
 
         'public' => [
-            'driver' => 'local',
+            'driver' => env('PUBLIC_FILESYSTEM_DRIVER', 'local'),
             'root' => storage_path('app/public'),
-            'url' => rtrim(env('APP_URL', 'http://localhost'), '/').'/storage',
+            'url' => env('PUBLIC_FILESYSTEM_URL', rtrim(env('APP_URL', 'http://localhost'), '/').'/storage'),
             'visibility' => 'public',
+            'key' => env('DO_SPACES_PUBLIC_KEY', env('DO_SPACES_KEY', env('AWS_ACCESS_KEY_ID'))),
+            'secret' => env('DO_SPACES_PUBLIC_SECRET', env('DO_SPACES_SECRET', env('AWS_SECRET_ACCESS_KEY'))),
+            'region' => env('DO_SPACES_PUBLIC_REGION', env('DO_SPACES_REGION', env('AWS_DEFAULT_REGION'))),
+            'bucket' => env('DO_SPACES_PUBLIC_BUCKET', env('AWS_BUCKET')),
+            'endpoint' => env('DO_SPACES_PUBLIC_ENDPOINT', env('DO_SPACES_ENDPOINT', env('AWS_ENDPOINT'))),
+            'use_path_style_endpoint' => env('DO_SPACES_PUBLIC_USE_PATH_STYLE_ENDPOINT', env('DO_SPACES_USE_PATH_STYLE_ENDPOINT', false)),
             'throw' => false,
             'report' => false,
         ],

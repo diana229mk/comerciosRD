@@ -1,0 +1,28 @@
+# Solo CI: complementa compose.testing.yaml para Feature e Integration.
+# Mismo entorno que la suite validada (DATA-02): caché/sesión en memoria, cola sync
+# y Redis desechable en la red interna. Sin puertos publicados ni datos persistentes.
+services:
+  test-mysql:
+    volumes: !override
+      - ./docker/testing/restrict-test-user.sql:/docker-entrypoint-initdb.d/10-restrict-test-user.sql:ro
+    tmpfs:
+      - /var/lib/mysql:size=2g
+
+  phpunit:
+    environment:
+      APP_KEY: base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+      DB_SOCKET: ""
+      CACHE_STORE: array
+      SESSION_DRIVER: array
+      QUEUE_CONNECTION: sync
+      REDIS_CLIENT: phpredis
+      REDIS_HOST: test-redis
+      REDIS_PORT: "6379"
+      REDIS_URL: ""
+      REDIS_USERNAME: ""
+      REDIS_PASSWORD: ""
+      REDIS_DB: "15"
+      REDIS_PREFIX: comercios_rd_ci_test_
+    depends_on:
+      test-redis:
+        condition: service_healthy

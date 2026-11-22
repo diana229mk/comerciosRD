@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use App\Contracts\MysqlServerIdentityReader;
+use App\Support\DatabaseTargetPolicy;
 use Illuminate\Support\Facades\DB;
 use PDO;
 use RuntimeException;
@@ -33,6 +34,10 @@ class PdoMysqlServerIdentityReader implements MysqlServerIdentityReader
         $socket = trim($connection['socket']);
         $host = trim($connection['host']);
         $port = trim($connection['port']);
+
+        if (DatabaseTargetPolicy::isTestingProcess()) {
+            DatabaseTargetPolicy::assertTestingEndpoint($host, $port, $socket);
+        }
 
         if ($socket === '') {
             if ($host === '' || preg_match('/^[0-9]{1,5}$/', $port) !== 1 || (int) $port > 65535

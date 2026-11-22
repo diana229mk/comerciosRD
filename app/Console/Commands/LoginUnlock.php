@@ -40,7 +40,8 @@ class LoginUnlock extends Command
                 return self::SUCCESS;
             }
             Cache::flush();
-            DB::table('login_attempts')->truncate();
+            // DELETE, no TRUNCATE: la cuenta de la app no tiene DROP.
+            DB::table('login_attempts')->delete();
             User::query()->update([
                 'failed_login_attempts' => 0,
                 'locked_until' => null,

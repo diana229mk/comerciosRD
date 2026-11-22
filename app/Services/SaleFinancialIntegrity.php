@@ -5,6 +5,7 @@ namespace App\Services;
 use App\Models\Sale;
 use App\Models\SaleItem;
 use App\Observers\SaleObserver;
+use App\Scopes\BranchScope;
 use Illuminate\Database\Connection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Query\Builder;
@@ -179,7 +180,9 @@ final class SaleFinancialIntegrity
                     $this->reject();
                 }
                 if ($model instanceof Sale && $operation !== 'delete' && ! $this->isConstructing($model)) {
-                    $persisted = Sale::withoutBusinessScope()->where('business_id', $businessId)
+                    $persisted = Sale::withoutBusinessScope()
+                        ->withoutGlobalScope(BranchScope::class)
+                        ->where('business_id', $businessId)
                         ->whereKey($model->getKey())->lockForUpdate()->firstOrFail();
                     if ($persisted->isCreditSale() && $persisted->isCompleted()) {
                         if ((int) $persisted->credit_version === 1

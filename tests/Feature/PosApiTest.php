@@ -107,6 +107,19 @@ class PosApiTest extends TestCase
             ->assertSee('Escanear', false);
     }
 
+    public function test_caja_uses_the_new_slug_and_rejects_the_previous_slug_after_rename(): void
+    {
+        ['business' => $business] = $this->seedPos();
+        $previousSlug = $business->slug;
+        $newSlug = 'renamed-'.Str::uuid();
+
+        $business->forceFill(['slug' => $newSlug])->save();
+
+        $this->assertSame($newSlug, $business->fresh()->slug);
+        $this->get('/caja/'.$newSlug)->assertOk();
+        $this->get('/caja/'.$previousSlug)->assertNotFound();
+    }
+
     public function test_guest_caja_redirects_to_admin_login(): void
     {
         $this->get('/caja/gg')

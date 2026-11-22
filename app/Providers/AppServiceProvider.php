@@ -39,10 +39,16 @@ use App\Services\SaleFinancialIntegrity;
 use App\Services\SaleReceivableIntegrity;
 use App\Services\SaleService;
 use App\Services\VerifiedMysqlConnector;
+use App\Support\DatabaseConnectionGuard;
+use App\Support\GuardedConnector;
 use App\Support\TestingDatabaseGuard;
 use Filament\Http\Responses\Auth\Contracts\LoginResponse;
 use Illuminate\Cache\RateLimiting\Limit;
 use Illuminate\Console\Events\CommandStarting;
+use Illuminate\Database\Connectors\MariaDbConnector;
+use Illuminate\Database\Connectors\PostgresConnector;
+use Illuminate\Database\Connectors\SQLiteConnector;
+use Illuminate\Database\Connectors\SqlServerConnector;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Gate;
@@ -56,6 +62,15 @@ class AppServiceProvider extends ServiceProvider
     public function register(): void
     {
         $this->app->bind('db.connector.mysql', VerifiedMysqlConnector::class);
+        foreach ([
+            'mariadb' => MariaDbConnector::class,
+            'pgsql' => PostgresConnector::class,
+            'sqlite' => SQLiteConnector::class,
+            'sqlsrv' => SqlServerConnector::class,
+        ] as $driver => $connector) {
+            $this->app->bind("db.connector.{$driver}", fn () => new GuardedConnector(new $connector));
+        }
+        DatabaseConnectionGuard::register($this->app);
         $this->app->singleton(MysqlServerIdentityReader::class, PdoMysqlServerIdentityReader::class);
 
         // FASE H1 · Cache request-scoped del contexto de acceso por sucursal.

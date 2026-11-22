@@ -1,0 +1,166 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static:
+    name: Validación estática y dependencias
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: intl, pdo_mysql, redis, gd, zip, bcmath
+          coverage: none
+          tools: composer:v2
+      - run: composer validate --strict --no-check-publish
+      - run: composer install --no-interaction --no-scripts --no-progress --prefer-dist
+      - name: composer audit (falla con cualquier aviso)
+        run: composer audit --locked
+      - name: php -l
+        run: find app bootstrap config database routes tests -name '*.php' -print0 | xargs -0 -n1 -P4 php -l > /dev/null
+      # Pint no es puerta todavía: 235 archivos heredados no cumplen el estilo (checklist P-07).
+      - name: Sintaxis de scripts de despliegue
+        run: |
+          for f in deploy-scripts/*.sh deploy/digitalocean/*.sh; do bash -n "$f"; done
+          sh -n docker/production-guard.sh docker/entrypoint.sh
+      - name: Production guard por roles
+        run: sh tests/deploy/production-guard-roles.sh
+      - name: Compose de producción renderiza y separa cuentas
+        run: |
+          d=$(mktemp -d)
+          printf 'DB_USERNAME=comercios_app\nDB_PASSWORD=x\nDB_DATABASE=comercios\nDB_HOST=db\nAPP_DOMAIN=ci.test\nACME_EMAIL=ci@ci.test\nREDIS_PASSWORD=abcdefghijklmnop12\n' > "$d/app.env"
+          printf 'DB_USERNAME=comercios_migrator\nDB_PASSWORD=y\n' > "$d/migrator.env"
+          printf 'PORTABILITY_DB_USERNAME=comercios_backup\nPORTABILITY_DB_PASSWORD=z\n' > "$d/backup.env"
+          COMERCIOS_ENV_FILE="$d/app.env" COMERCIOS_SECRETS_DIR="$d" COMERCIOS_IMAGE_TAG=ci \
+            docker compose -f compose.production.yaml --env-file "$d/app.env" \
+            --profile primary --profile migrate config --format json > "$d/out.json"
+          python3 - "$d/out.json" <<'PY'
+          import json, sys
+          s = json.load(open(sys.argv[1]))['services']
+          assert s['migrate']['environment']['DB_USERNAME'] == 'comercios_migrator'
+          assert s['app']['environment']['DB_USERNAME'] == 'comercios_app'
+          assert 'PORTABILITY_DB_USERNAME' not in s['app']['environment']
+          assert s['scheduler']['environment']['PORTABILITY_DB_USERNAME'] == 'comercios_backup'
+          assert s['app']['image'] == 'comercios-rd-php:ci'
+          print('compose de producción OK')
+          PY
+
+  frontend:
+    name: Dependencias JS
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm ci --ignore-scripts
+      - run: npm audit --omit=dev --audit-level=high
+      - run: npm run build
+
+  unit:
+    name: Suite Unit (Docker aislado)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs: static
+    steps:
+      - uses: actions/checkout@v4
+      - name: Secretos efímeros del entorno de pruebas
+        run: |
+          umask 077
+          printf 'COMERCIOS_TEST_MYSQL_ROOT_PASSWORD=%s\nCOMERCIOS_TEST_DB_PASSWORD=%s\n' \
+            "$(openssl rand -hex 24)" "$(openssl rand -hex 24)" > .env.testing.docker
+      - name: Build
+        run: docker compose --profile testing --env-file .env.testing.docker -f compose.testing.yaml build phpunit
+      - name: PHPUnit tests/Unit
+        run: docker compose --profile testing --env-file .env.testing.docker -f compose.testing.yaml run --rm -T phpunit ./vendor/bin/phpunit --colors=never tests/Unit
+      - name: Limpieza del proyecto de CI
+        if: always()
+        run: docker compose --profile testing --env-file .env.testing.docker -f compose.testing.yaml down -v
+
+  feature-integration:
+    name: Feature e Integration (Docker aislado)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    needs: static
+    env:
+      DC: docker compose --profile testing --env-file .env.testing.docker -f compose.testing.yaml -f compose.ci.yaml
+      DCT: docker compose --profile tls-testing --env-file .env.testing.docker -f compose.testing.yaml
+    steps:
+      - uses: actions/checkout@v4
+      - name: Secretos efímeros del entorno de pruebas
+        run: |
+          umask 077
+          printf 'COMERCIOS_TEST_MYSQL_ROOT_PASSWORD=%s\nCOMERCIOS_TEST_DB_PASSWORD=%s\n' \
+            "$(openssl rand -hex 24)" "$(openssl rand -hex 24)" > .env.testing.docker
+      - name: Build
+        run: $DC build phpunit
+      - name: Guard, PHPUnit sin runtime autorizado debe bloquearse
+        run: |
+          set +e
+          out="$($DC run --rm -T -e COMERCIOS_TEST_RUNTIME= phpunit ./vendor/bin/phpunit tests/Feature/SaleCreditIntegrityTest.php 2>&1)"; rc=$?
+          set -e
+          echo "$out" | tail -5
+          [ "$rc" -ne 0 ] && grep -q 'Runtime de pruebas no autorizado' <<<"$out" && ! grep -q 'SQLSTATE' <<<"$out"
+      - name: Migraciones sobre el MySQL efímero (usuario de pruebas restringido)
+        run: |
+          $DC run --rm -T phpunit php artisan migrate --force --no-interaction
+          $DC run --rm -T phpunit php artisan migrate:status --no-interaction | tail -3
+      - name: PHPUnit tests/Feature
+        run: $DC run --rm -T phpunit ./vendor/bin/phpunit --colors=never --display-skipped tests/Feature
+      - name: Integration, concurrencia de cuentas por cobrar
+        run: $DC run --rm -T -e DATA02_CONCURRENCY_INTEGRATION=1 phpunit ./vendor/bin/phpunit --colors=never tests/Integration/ReceivablePaymentConcurrencyTest.php
+      - name: Integration, colas contables
+        run: $DC run --rm -T -e ACCOUNTING_QUEUE_INTEGRATION=1 phpunit ./vendor/bin/phpunit --colors=never tests/Integration/PostSaleAccountingQueueTest.php
+      - name: Integration, backup y restauración MySQL
+        run: |
+          set -a; . ./.env.testing.docker; set +a
+          $DC run --rm -T -e PORTABILITY_MYSQL_INTEGRATION=1 -e PORTABILITY_TEST_MYSQL_HOST=test-mysql \
+            -e PORTABILITY_TEST_MYSQL_PASSWORD="$COMERCIOS_TEST_MYSQL_ROOT_PASSWORD" \
+            phpunit ./vendor/bin/phpunit --colors=never tests/Integration/PortabilityMysqlRestoreTest.php
+      - name: Integration, MySQL TLS
+        run: |
+          $DC down -v
+          $DCT run --rm -T tls-certificates
+          $DCT up -d --no-build --no-deps --wait test-mysql-tls test-mysql-no-tls
+          $DCT run --rm --no-deps -T phpunit-tls
+          $DCT run --rm --no-deps -T phpunit-tls ./vendor/bin/phpunit --colors=never tests/Integration/MysqlTlsTest.php
+      - name: Limpieza del proyecto de CI
+        if: always()
+        run: |
+          $DC down -v || true
+          $DCT down -v || true
+
+  image-scan:
+    name: Imagen de producción y escaneo
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs: static
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build app
+        run: docker build --target app -t comercios-rd-php:ci .
+      - name: Build web y nginx -t
+        run: |
+          docker build --target web -t comercios-rd-nginx:ci .
+          docker run --rm comercios-rd-nginx:ci nginx -t
+      - name: Trivy (CRITICAL/HIGH con parche disponible)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: comercios-rd-php:ci
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '1'

@@ -57,7 +57,7 @@ php artisan config:clear
 php artisan security:preflight --strict
 npm ci
 npm run build
-php artisan migrate --force
+COMERCIOS_SCHEMA_CHANGE_APPROVAL="$(env_value DB_DATABASE)@$(env_value DB_HOST)" php artisan migrate --force
 php artisan config:cache
 php artisan route:cache
 php artisan view:cache

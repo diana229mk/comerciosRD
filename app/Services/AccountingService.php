@@ -10,7 +10,10 @@ use App\Models\Business;
 use App\Models\Expense;
 use App\Models\JournalEntry;
 use App\Models\JournalEntryLine;
+use App\Models\ReceivablePayment;
+use App\Models\ReceivablePaymentReversal;
 use App\Models\Sale;
+use App\Models\SaleReturnOperation;
 use App\Support\TenantContext;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -30,6 +33,7 @@ class AccountingService
             ['code' => '1301', 'name' => 'Inventario', 'type' => 'asset', 'is_system' => true],
             ['code' => '2101', 'name' => 'Cuentas por Pagar', 'type' => 'liability', 'is_system' => true],
             ['code' => '2201', 'name' => 'ITBIS por Pagar', 'type' => 'liability', 'is_system' => true],
+            ['code' => '2301', 'name' => 'Reembolsos a Clientes por Pagar', 'type' => 'liability', 'is_system' => true],
             ['code' => '3101', 'name' => 'Capital', 'type' => 'equity', 'is_system' => true],
             ['code' => '3201', 'name' => 'Utilidades Retenidas', 'type' => 'equity', 'is_system' => true],
             ['code' => '4101', 'name' => 'Ventas', 'type' => 'income', 'is_system' => true],
@@ -91,6 +95,7 @@ class AccountingService
                     if (in_array($outbox->status, ['processed', 'skipped'], true)) {
                         return;
                     }
+
                     if ($outbox->status === 'failed') {
                         throw new \RuntimeException('Evento contable agotado; requiere recuperación explícita.');
                     }
@@ -209,13 +214,15 @@ class AccountingService
                     }
 
                     // 4. Costo de Ventas + Inventario
+                    // DATA-03: un unit_cost explícito de 0 es legítimo (producto sin costo).
+                    // Solo se usa el costo actual del producto cuando unit_cost es null (dato faltante).
                     $totalCost = 0.0;
                     foreach ($sale->items as $item) {
-                        $unitCost = (float) ($item->unit_cost ?? 0);
-                        if ($unitCost <= 0) {
-                            $unitCost = (float) ($item->product?->cost ?? 0);
+                        $unitCost = $item->unit_cost;
+                        if ($unitCost === null) {
+                            $unitCost = $item->product?->cost ?? 0;
                         }
-                        $totalCost += $unitCost * (float) $item->quantity;
+                        $totalCost += (float) $unitCost * (float) $item->quantity;
                     }
                     $totalCost = round($totalCost, 2);
 
@@ -364,6 +371,320 @@ class AccountingService
             ]);
             throw $e;
         }
+    }
+
+    public static function createFromReceivablePayment(ReceivablePayment $payment): JournalEntry
+    {
+        return TenantContext::run((string) $payment->business_id, function () use ($payment): JournalEntry {
+            return DB::transaction(function () use ($payment): JournalEntry {
+                return self::createSourceEntry(
+                    (string) $payment->business_id,
+                    'receivable_payment',
+                    (string) $payment->id,
+                    'Cobro CxC #'.$payment->id,
+                    'Cobro de cuenta por cobrar',
+                    (string) $payment->payment_date,
+                    self::paymentAccountCode($payment->payment_method),
+                    '1201',
+                    (float) $payment->amount,
+                    $payment->created_by ? (string) $payment->created_by : null,
+                );
+            });
+        });
+    }
+
+    public static function createFromReceivablePaymentReversal(ReceivablePaymentReversal $reversal): JournalEntry
+    {
+        $payment = $reversal->payment;
+        if (! $payment) {
+            throw new \RuntimeException('La anulación requiere un cobro existente.');
+        }
+
+        return TenantContext::run((string) $reversal->business_id, function () use ($reversal, $payment): JournalEntry {
+            return DB::transaction(function () use ($reversal, $payment): JournalEntry {
+                return self::createSourceEntry(
+                    (string) $reversal->business_id,
+                    'receivable_payment_reversal',
+                    (string) $reversal->id,
+                    'Anulación cobro CxC #'.$payment->id,
+                    'Reversión de cobro de cuenta por cobrar',
+                    now()->toDateString(),
+                    '1201',
+                    self::paymentAccountCode($payment->payment_method),
+                    (float) $payment->amount,
+                    $reversal->created_by ? (string) $reversal->created_by : null,
+                );
+            });
+        });
+    }
+
+    public static function createFromSaleReturn(SaleReturnOperation $operation, Sale $sale): JournalEntry
+    {
+        return TenantContext::run((string) $operation->business_id, function () use ($operation, $sale): JournalEntry {
+            return DB::transaction(function () use ($operation, $sale): JournalEntry {
+                $refund = round((float) $operation->refund_amount, 2);
+                $tax = min($refund, round((float) $operation->tax_amount, 2));
+                $net = round($refund - $tax, 2);
+                $cost = round((float) $operation->inventory_cost, 2);
+                $due = min($refund, round((float) $operation->refund_due_amount, 2));
+                $lines = [];
+
+                if ($net > 0) {
+                    $lines[] = ['code' => '4101', 'debit' => $net, 'credit' => 0, 'description' => 'Devolución de ventas'];
+                }
+                if ($tax > 0) {
+                    $lines[] = ['code' => '2201', 'debit' => $tax, 'credit' => 0, 'description' => 'Reversión de ITBIS'];
+                }
+                if ($cost > 0) {
+                    $lines[] = ['code' => '1301', 'debit' => $cost, 'credit' => 0, 'description' => 'Ingreso de inventario devuelto'];
+                    $lines[] = ['code' => '5101', 'debit' => 0, 'credit' => $cost, 'description' => 'Reversión de costo de ventas'];
+                }
+
+                $creditAmount = round($refund - $due, 2);
+                if ($creditAmount > 0) {
+                    $creditCode = $operation->refund_channel === 'receivable'
+                        ? '1201'
+                        : (($operation->refund_status === 'settled')
+                            ? self::paymentAccountCode($operation->refund_method)
+                            : '2301');
+                    $lines[] = [
+                        'code' => $creditCode,
+                        'debit' => 0,
+                        'credit' => $creditAmount,
+                        'description' => 'Reembolso de venta',
+                    ];
+                }
+                if ($due > 0) {
+                    $lines[] = [
+                        'code' => '2301',
+                        'debit' => 0,
+                        'credit' => $due,
+                        'description' => 'Reembolso pendiente a cliente',
+                    ];
+                }
+
+                if ($lines === []) {
+                    throw new \RuntimeException('La devolución no tiene importes contables para registrar.');
+                }
+
+                return self::createMultiLineSourceEntry(
+                    (string) $operation->business_id,
+                    'sale_return',
+                    (string) $operation->id,
+                    'Devolución venta #'.($sale->sale_number ?: $sale->number ?: $sale->id),
+                    'Reversión contable de devolución de venta',
+                    now()->toDateString(),
+                    $lines,
+                    $operation->created_by ? (string) $operation->created_by : null,
+                );
+            });
+        });
+    }
+
+    public static function createFromSaleRefundSettlement(SaleReturnOperation $operation): JournalEntry
+    {
+        return TenantContext::run((string) $operation->business_id, function () use ($operation): JournalEntry {
+            return DB::transaction(function () use ($operation): JournalEntry {
+                $amount = round((float) $operation->refund_due_amount, 2);
+
+                return self::createMultiLineSourceEntry(
+                    (string) $operation->business_id,
+                    'sale_return_refund_settlement',
+                    (string) $operation->id,
+                    'Liquidación de reembolso #'.$operation->id,
+                    'Liquidación de reembolso pendiente',
+                    $operation->refund_settled_at?->toDateString() ?? now()->toDateString(),
+                    [
+                        ['code' => '2301', 'debit' => $amount, 'credit' => 0, 'description' => 'Liquidación de reembolso pendiente'],
+                        [
+                            'code' => self::paymentAccountCode($operation->refund_method),
+                            'debit' => 0,
+                            'credit' => $amount,
+                            'description' => 'Pago de reembolso',
+                        ],
+                    ],
+                    auth()->id() ? (string) auth()->id() : null,
+                );
+            });
+        });
+    }
+
+    private static function createSourceEntry(
+        string $businessId,
+        string $sourceType,
+        string $sourceId,
+        string $reference,
+        string $description,
+        string $date,
+        string $debitCode,
+        string $creditCode,
+        float $amount,
+        ?string $createdBy,
+    ): JournalEntry {
+        $amount = round($amount, 2);
+        if ($amount <= 0) {
+            throw new \RuntimeException('No se puede contabilizar un importe no positivo.');
+        }
+
+        $existing = JournalEntry::withoutBusinessScope()->withTrashed()
+            ->where('business_id', $businessId)
+            ->where('source_type', $sourceType)
+            ->where('source_id', $sourceId)
+            ->lockForUpdate()
+            ->first();
+        if ($existing) {
+            if ($existing->trashed() || ! $existing->isPosted() || ! $existing->isBalanced()
+                || round((float) $existing->total_debit, 2) !== $amount
+                || round((float) $existing->total_credit, 2) !== $amount
+                || $existing->lines()->count() !== 2) {
+                throw new \RuntimeException('El asiento financiero existente es inconsistente.');
+            }
+
+            return $existing;
+        }
+
+        $accounts = Account::withoutBusinessScope()
+            ->where('business_id', $businessId)
+            ->whereIn('code', [$debitCode, $creditCode])
+            ->where('is_active', true)
+            ->get()
+            ->keyBy('code');
+        $debitAccount = $accounts->get($debitCode);
+        $creditAccount = $accounts->get($creditCode);
+        if (! $debitAccount || ! $creditAccount) {
+            throw new \RuntimeException('Faltan cuentas contables activas para registrar el movimiento de CxC.');
+        }
+
+        $entry = new JournalEntry([
+            'date' => $date,
+            'reference' => $reference,
+            'description' => $description,
+            'status' => JournalEntry::STATUS_POSTED,
+            'total_debit' => $amount,
+            'total_credit' => $amount,
+            'created_by' => $createdBy,
+        ]);
+        $entry->forceFill([
+            'business_id' => $businessId,
+            'source_type' => $sourceType,
+            'source_id' => $sourceId,
+        ])->save();
+
+        JournalEntryLine::create([
+            'journal_entry_id' => $entry->id,
+            'account_id' => $debitAccount->id,
+            'debit' => $amount,
+            'credit' => 0,
+            'description' => $description,
+        ]);
+        JournalEntryLine::create([
+            'journal_entry_id' => $entry->id,
+            'account_id' => $creditAccount->id,
+            'debit' => 0,
+            'credit' => $amount,
+            'description' => $description,
+        ]);
+
+        $entry->refresh();
+        if (! $entry->isBalanced()) {
+            throw new \RuntimeException('El asiento del movimiento de CxC no quedó balanceado.');
+        }
+
+        return $entry;
+    }
+
+    /**
+     * @param  list<array{code:string,debit:float|int,credit:float|int,description:string}>  $lines
+     */
+    private static function createMultiLineSourceEntry(
+        string $businessId,
+        string $sourceType,
+        string $sourceId,
+        string $reference,
+        string $description,
+        string $date,
+        array $lines,
+        ?string $createdBy,
+    ): JournalEntry {
+        $existing = JournalEntry::withoutBusinessScope()->withTrashed()
+            ->where('business_id', $businessId)
+            ->where('source_type', $sourceType)
+            ->where('source_id', $sourceId)
+            ->lockForUpdate()
+            ->first();
+        if ($existing) {
+            if ($existing->trashed() || ! $existing->isPosted() || ! $existing->isBalanced()
+                || $existing->lines()->count() !== count($lines)
+                || round((float) $existing->lines()->sum('debit'), 2) !== round((float) $existing->total_debit, 2)
+                || round((float) $existing->lines()->sum('credit'), 2) !== round((float) $existing->total_credit, 2)) {
+                throw new \RuntimeException('El asiento de devolución existente es inconsistente.');
+            }
+
+            return $existing;
+        }
+
+        $codes = array_values(array_unique(array_column($lines, 'code')));
+        $accounts = Account::withoutBusinessScope()
+            ->where('business_id', $businessId)
+            ->whereIn('code', $codes)
+            ->where('is_active', true)
+            ->get()
+            ->keyBy('code');
+        if (in_array('2301', $codes, true) && ! $accounts->has('2301')) {
+            $refundAccount = new Account([
+                'code' => '2301',
+                'name' => 'Reembolsos a Clientes por Pagar',
+                'type' => 'liability',
+                'is_system' => true,
+                'is_active' => true,
+            ]);
+            $refundAccount->business_id = $businessId;
+            $refundAccount->saveQuietly();
+            $accounts->put('2301', $refundAccount);
+        }
+
+        $debit = round(array_sum(array_column($lines, 'debit')), 2);
+        $credit = round(array_sum(array_column($lines, 'credit')), 2);
+        if ($debit <= 0 || abs($debit - $credit) >= 0.01) {
+            throw new \RuntimeException('El asiento de devolución no está balanceado.');
+        }
+        foreach ($codes as $code) {
+            if (! $accounts->has($code)) {
+                throw new \RuntimeException("Falta la cuenta contable {$code} para registrar la devolución.");
+            }
+        }
+
+        $entry = new JournalEntry([
+            'date' => $date,
+            'reference' => $reference,
+            'description' => $description,
+            'status' => JournalEntry::STATUS_POSTED,
+            'total_debit' => $debit,
+            'total_credit' => $credit,
+            'created_by' => $createdBy,
+        ]);
+        $entry->forceFill([
+            'business_id' => $businessId,
+            'source_type' => $sourceType,
+            'source_id' => $sourceId,
+        ])->save();
+
+        foreach ($lines as $line) {
+            JournalEntryLine::create([
+                'journal_entry_id' => $entry->id,
+                'account_id' => $accounts[$line['code']]->id,
+                'debit' => $line['debit'],
+                'credit' => $line['credit'],
+                'description' => $line['description'],
+            ]);
+        }
+
+        $entry->refresh();
+        if (! $entry->isBalanced()) {
+            throw new \RuntimeException('El asiento de devolución no quedó balanceado.');
+        }
+
+        return $entry;
     }
 
     protected static function saleIsCompleted(Sale $sale): bool

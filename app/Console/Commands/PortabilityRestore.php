@@ -5,6 +5,7 @@ namespace App\Console\Commands;
 use App\Services\MysqlTlsPolicy;
 use App\Services\PortabilityRestoreOperations;
 use App\Services\PortabilityRestoreTargetGuard;
+use App\Support\DatabaseTargetPolicy;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\File;
 
@@ -204,6 +205,9 @@ class PortabilityRestore extends Command
     protected function mysqlCnf(string $binary): string
     {
         $conn = $this->targetConnection();
+        if (DatabaseTargetPolicy::isTestingProcess()) {
+            DatabaseTargetPolicy::assertTestingEndpoint($conn['host'], $conn['port'], $conn['socket']);
+        }
         $tlsOptions = MysqlTlsPolicy::clientOptions($conn, $binary);
         $user = MysqlTlsPolicy::quote($conn['username']);
         $pass = MysqlTlsPolicy::quote($conn['password']);

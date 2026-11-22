@@ -1,5 +1,6 @@
 <?php
 
+use App\Services\SaleReturnOperationService;
 use Illuminate\Foundation\Inspiring;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
@@ -41,6 +42,11 @@ Schedule::command('sales:rebuild-daily')
 Schedule::command('accounting:outbox-dispatch')
     ->everyMinute()
     ->when(fn () => (bool) config('scale.post_sale_queue'));
+
+Schedule::call(fn () => app(SaleReturnOperationService::class)->retryDueCreditNotes())
+    ->everyMinute()
+    ->name('sales:retry-return-credit-notes')
+    ->withoutOverlapping();
 
 // Compatibilidad de efectos heredados; no es la recuperación durable del outbox.
 Schedule::command('sales:reconcile-side-effects --hours=24')

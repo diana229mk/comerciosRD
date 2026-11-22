@@ -36,3 +36,4 @@ COMO-ARRANCAR.md
 *.secret
 backups
 backup
+bootstrap/cache/config.php

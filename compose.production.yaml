@@ -1,0 +1,314 @@
+# ComerciosRD en un Droplet de DigitalOcean.
+# No reutiliza el Compose local: ese stack rechaza MySQL y Redis externos.
+# El nodo primary arranca Caddy, Redis y el scheduler.
+# Una réplica posterior arranca solo app, worker y nginx, contra Redis y archivos compartidos.
+
+name: comercios-rd-production
+
+x-app-environment: &app-environment
+  DOCKER_PRODUCTION: "1"
+  DOCKER_LOCAL_ISOLATION: "0"
+  COMERCIOS_NODE_ROLE: ${COMERCIOS_NODE_ROLE:-primary}
+  APP_ENV: production
+  APP_DEBUG: "false"
+  ECF_ENABLED: "false"
+  LOG_CHANNEL: stderr
+  LOG_LEVEL: info
+  DB_CONNECTION: mysql
+  DB_URL: ""
+  DB_SOCKET: ""
+  MYSQL_SSL_REQUIRED: "true"
+  MYSQL_ATTR_SSL_CA: /secrets/mysql-ca.pem
+  REDIS_CLIENT: phpredis
+  CACHE_STORE: redis
+  SESSION_DRIVER: redis
+  SESSION_ENCRYPT: "true"
+  SESSION_SECURE_COOKIE: "true"
+  QUEUE_CONNECTION: redis
+  SCALE_POST_SALE_QUEUE: "true"
+  TRUSTED_PROXIES: ${TRUSTED_PROXIES:-*}
+  APP_MAINTENANCE_DRIVER: cache
+  APP_MAINTENANCE_STORE: redis
+  PORTABILITY_BACKUP_ENABLED: "true"
+  PORTABILITY_BACKUP_DIR: /var/backups/comerciosrd
+  TMPDIR: /var/backups/comerciosrd/tmp
+
+x-app-volumes: &app-volumes
+  - ${COMERCIOS_SECRETS_DIR:-/etc/comerciosrd}/mysql-ca.pem:/secrets/mysql-ca.pem:ro
+  - ${COMERCIOS_SECRETS_DIR:-/etc/comerciosrd}/zz-scale.conf:/usr/local/etc/php-fpm.d/zz-scale.conf:ro
+  - public_storage:/var/www/html/storage/app/public
+  - private_storage:/var/www/html/storage/app/private
+  - framework_storage:/var/www/html/storage/framework
+  - app_logs:/var/www/html/storage/logs
+  - production_backups:/var/backups/comerciosrd
+
+x-app-service: &app-service
+  build:
+    context: .
+    dockerfile: Dockerfile
+    target: app
+  image: comercios-rd-php:${COMERCIOS_IMAGE_TAG:-production}
+  restart: unless-stopped
+  user: "0:0"
+  init: true
+  stop_grace_period: 30s
+  read_only: true
+  cap_drop:
+    - ALL
+  cap_add:
+    - CHOWN
+    - SETGID
+    - SETUID
+  security_opt:
+    - no-new-privileges:true
+  tmpfs:
+    - /tmp:size=64m,uid=33,gid=33,mode=1770
+    - /var/run:size=8m,uid=33,gid=33,mode=0750
+    - /usr/local/var/run:size=8m,uid=33,gid=33,mode=0750
+  env_file:
+    - ${COMERCIOS_ENV_FILE:-.env.production}
+  environment: *app-environment
+  volumes: *app-volumes
+  networks:
+    - private
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "5"
+
+services:
+  app:
+    <<: *app-service
+    deploy:
+      resources:
+        limits:
+          memory: 1024M
+    healthcheck:
+      test:
+        - CMD
+        - php
+        - -r
+        - "$$s=@fsockopen('127.0.0.1',9000,$$e,$$m,2); exit($$s ? 0 : 1);"
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+
+  worker:
+    <<: *app-service
+    stop_grace_period: 120s
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+    command:
+      - php
+      - artisan
+      - queue:work
+      - redis
+      - --queue=${SCALE_QUEUE_SALES:-sales},${SCALE_QUEUE_REPORTS:-reports},${REDIS_QUEUE:-default}
+      - --sleep=3
+      - --tries=3
+      - --timeout=90
+      - --max-time=3600
+      - --memory=256
+    healthcheck:
+      test:
+        - CMD
+        - php
+        - -r
+        - "$$c=@file_get_contents('/proc/2/cmdline'); exit($$c !== false && str_contains($$c,'queue:work') ? 0 : 1);"
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 30s
+
+  scheduler:
+    <<: *app-service
+    stop_grace_period: 120s
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          memory: 1024M
+    # Solo el scheduler recibe la cuenta de backup (lectura); nunca la app ni el worker.
+    env_file:
+      - path: ${COMERCIOS_ENV_FILE:-.env.production}
+      - path: ${COMERCIOS_SECRETS_DIR:-/etc/comerciosrd}/backup.env
+        required: false
+    environment:
+      <<: *app-environment
+      COMERCIOS_DB_ROLE: backup
+      COMERCIOS_APP_DB_USERNAME: ${DB_USERNAME:-}
+    command:
+      - php
+      - artisan
+      - schedule:work
+    healthcheck:
+      test:
+        - CMD
+        - php
+        - -r
+        - "$$c=@file_get_contents('/proc/2/cmdline'); exit($$c !== false && str_contains($$c,'schedule:work') ? 0 : 1);"
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 20s
+
+  migrate:
+    <<: *app-service
+    profiles:
+      - migrate
+    restart: "no"
+    # migrator.env sustituye DB_USERNAME/DB_PASSWORD por la cuenta con DDL.
+    # Si falta, el production guard rechaza el arranque (exit 78).
+    env_file:
+      - path: ${COMERCIOS_ENV_FILE:-.env.production}
+      - path: ${COMERCIOS_SECRETS_DIR:-/etc/comerciosrd}/migrator.env
+        required: false
+    environment:
+      <<: *app-environment
+      COMERCIOS_DB_ROLE: migrator
+      COMERCIOS_APP_DB_USERNAME: ${DB_USERNAME:-}
+      # Explicit approval checked by the artisan gate; only this service carries it.
+      COMERCIOS_SCHEMA_CHANGE_APPROVAL: "${DB_DATABASE:-}@${DB_HOST:-}"
+    command:
+      - php
+      - artisan
+      - migrate
+      - --force
+      - --isolated
+
+  nginx:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: web
+    image: comercios-rd-nginx:${COMERCIOS_IMAGE_TAG:-production}
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 15s
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /var/cache/nginx:size=32m,uid=101,gid=33,mode=0750
+      - /tmp:size=8m,uid=101,gid=33,mode=1770
+    volumes:
+      - public_storage:/srv/public-storage:ro
+    networks:
+      - edge
+      - private
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - wget -q -O /dev/null http://127.0.0.1:8080/up
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  caddy:
+    profiles:
+      - primary
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    init: true
+    environment:
+      APP_DOMAIN: ${APP_DOMAIN:?Set APP_DOMAIN}
+      ACME_EMAIL: ${ACME_EMAIL:?Set ACME_EMAIL}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - edge
+    depends_on:
+      nginx:
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  redis:
+    profiles:
+      - primary
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    init: true
+    environment:
+      REDISCLI_AUTH: ${REDIS_PASSWORD:?Set REDIS_PASSWORD}
+    command:
+      - redis-server
+      - /usr/local/etc/redis/redis.conf
+    volumes:
+      - ${COMERCIOS_SECRETS_DIR:-/etc/comerciosrd}/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - redis_data:/data
+    networks:
+      - private
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - redis-cli --no-auth-warning ping | grep -q PONG
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 384M
+
+networks:
+  edge:
+    driver: bridge
+  private:
+    driver: bridge
+
+volumes:
+  redis_data:
+    name: comercios_rd_production_redis
+  public_storage:
+    name: comercios_rd_production_public
+  private_storage:
+    name: comercios_rd_production_private
+  framework_storage:
+    name: comercios_rd_production_framework
+  app_logs:
+    name: comercios_rd_production_logs
+  production_backups:
+    name: comercios_rd_production_backups
+  caddy_data:
+    name: comercios_rd_production_caddy
+  caddy_config:
+    name: comercios_rd_production_caddy_config
