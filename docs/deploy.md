@@ -5,6 +5,10 @@ Purpose
 -------
 This document is a step-by-step checklist to deploy ComerciosRD to production safely, plus preflight checks, health checks, and a rollback plan.
 
+DigitalOcean
+------------
+The Droplet stack is `compose.production.yaml`, not `compose.yaml`. Follow [digitalocean.md](digitalocean.md). The local Compose file refuses external MySQL and Redis on purpose.
+
 Before you start
 ----------------
 - Do not store secrets in the repository. Use a secure vault or environment variables in your hosting platform.

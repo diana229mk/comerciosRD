@@ -8,6 +8,7 @@
 !.env.docker.example
 !.env.testing.docker.example
 !.env.production.example
+!.env.digitalocean.example
 .env.backup
 .env.production
 .env.staging

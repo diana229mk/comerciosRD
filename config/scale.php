@@ -2,7 +2,9 @@
 
 return [
 
-    'target_concurrent_users' => max(1, (int) env('SCALE_TARGET_CONCURRENT_USERS', 10000)),
+    // Default production sizing for a horizontally scaled DigitalOcean deployment.
+    // The application remains safe if the environment sets a higher or lower number.
+    'target_concurrent_users' => max(1, (int) env('SCALE_TARGET_CONCURRENT_USERS', 50000)),
 
     /*
     |--------------------------------------------------------------------------

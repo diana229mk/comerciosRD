@@ -1,0 +1,29 @@
+-- Cuentas de privilegios mínimos para Managed MySQL 8.4 (DigitalOcean).
+-- init-do-env.sh genera /etc/comerciosrd/mysql-accounts.sql (0600) con las
+-- contraseñas reales. Ejecutarlo UNA vez como doadmin, sobre una base nueva,
+-- y borrar el archivo generado después:
+--   mysql --ssl-mode=VERIFY_IDENTITY --ssl-ca=/etc/comerciosrd/mysql-ca.pem \
+--     -h <host-privado> -P 25060 -u doadmin -p < /etc/comerciosrd/mysql-accounts.sql
+-- Nunca se usa doadmin desde la aplicación.
+
+CREATE DATABASE IF NOT EXISTS `__DB__` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+-- App, worker y scheduler: solo DML.
+CREATE USER '__APP_USER__'@'%' IDENTIFIED BY '__APP_PASSWORD__' REQUIRE SSL;
+GRANT SELECT, INSERT, UPDATE, DELETE ON `__DB__`.* TO '__APP_USER__'@'%';
+
+-- Servicio migrate: DDL sobre la base de la app, nada global.
+CREATE USER '__MIGRATOR_USER__'@'%' IDENTIFIED BY '__MIGRATOR_PASSWORD__' REQUIRE SSL;
+GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, DROP, REFERENCES,
+      CREATE VIEW, SHOW VIEW, TRIGGER, LOCK TABLES, CREATE TEMPORARY TABLES,
+      EVENT, EXECUTE, CREATE ROUTINE, ALTER ROUTINE
+  ON `__DB__`.* TO '__MIGRATOR_USER__'@'%';
+
+-- portability:backup (mysqldump --single-transaction): solo lectura.
+-- El esquema no define rutinas; si algún día las tiene, añadir SHOW_ROUTINE.
+CREATE USER '__BACKUP_USER__'@'%' IDENTIFIED BY '__BACKUP_PASSWORD__' REQUIRE SSL;
+GRANT SELECT, SHOW VIEW, TRIGGER, EVENT, LOCK TABLES ON `__DB__`.* TO '__BACKUP_USER__'@'%';
+
+SHOW GRANTS FOR '__APP_USER__'@'%';
+SHOW GRANTS FOR '__MIGRATOR_USER__'@'%';
+SHOW GRANTS FOR '__BACKUP_USER__'@'%';

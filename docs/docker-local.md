@@ -136,11 +136,11 @@ rules as verified until `nginx -t`, `nginx -T`, and the HTTP checks above pass.
 ## DigitalOcean staging prerequisites
 
 This Compose file intentionally refuses external database and Redis
-connections. Do not reuse it as a production deployment manifest. Before
-staging, prepare a separate deployment definition with a private VPC path to
-managed MySQL/Redis or isolated database containers, explicit outbound access
-for required services, and the local-isolation guard disabled only for that
-reviewed deployment.
+connections. Do not reuse it as a production deployment manifest. The
+DigitalOcean manifest is `compose.production.yaml`, with the runbook in
+[digitalocean.md](digitalocean.md). It uses a private VPC path to managed
+MySQL, keeps Redis unpublished, and turns off the local-isolation guard only
+in that stack.
 
 Build and publish images through a controlled CI pipeline. Pin PHP, Composer,
 Node, Nginx, MySQL, and Redis base images by immutable digest for releases;

@@ -25,6 +25,7 @@ RUN apt-get update \
         libcurl4-openssl-dev \
         libxml2-dev \
         unzip \
+        default-mysql-client \
     && docker-php-ext-configure gd --with-freetype --with-jpeg \
     && docker-php-ext-install -j"$(nproc)" \
         bcmath \
@@ -108,8 +109,11 @@ COPY --from=assets --chown=www-data:www-data /src/public/build /var/www/html/pub
 COPY docker/php/zz-app.ini /usr/local/etc/php/conf.d/zz-app.ini
 COPY docker/php/www.conf /usr/local/etc/php-fpm.d/zz-app.conf
 COPY docker/entrypoint.sh /usr/local/bin/comercios-entrypoint
+COPY docker/production-guard.sh /usr/local/bin/production-guard.sh
 
-RUN chmod 0555 /usr/local/bin/comercios-entrypoint \
+RUN chmod 0555 /usr/local/bin/comercios-entrypoint /usr/local/bin/production-guard.sh \
+    && ln -sfn ../storage/app/public /var/www/html/public/storage \
+    && chown -h www-data:www-data /var/www/html/public/storage \
     && mkdir -p \
         storage/app/private \
         storage/app/public \

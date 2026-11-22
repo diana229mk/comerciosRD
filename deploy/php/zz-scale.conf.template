@@ -1,0 +1,5 @@
+[www]
+pm.max_children = __MAX_CHILDREN__
+pm.start_servers = __START_SERVERS__
+pm.min_spare_servers = __MIN_SPARE__
+pm.max_spare_servers = __MAX_SPARE__
