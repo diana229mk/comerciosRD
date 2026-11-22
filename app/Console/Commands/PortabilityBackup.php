@@ -146,8 +146,17 @@ class PortabilityBackup extends Command
 
     protected function mysqlCnf(string $binary): string
     {
-        $conn = config('database.connections.mysql');
-        DatabaseTargetPolicy::assertExternalClientAllowed((array) $conn);
+        $conn = (array) config('database.connections.mysql');
+        $backupUser = (string) config('portability.db_username', '');
+        if ($backupUser !== '') {
+            $backupPassword = (string) config('portability.db_password', '');
+            if ($backupPassword === '') {
+                throw new \RuntimeException('PORTABILITY_DB_PASSWORD es obligatorio cuando PORTABILITY_DB_USERNAME está definido.');
+            }
+            $conn['username'] = $backupUser;
+            $conn['password'] = $backupPassword;
+        }
+        DatabaseTargetPolicy::assertExternalClientAllowed($conn);
         $tlsOptions = MysqlTlsPolicy::clientOptions($conn, $binary);
         $user = MysqlTlsPolicy::quote((string) ($conn['username'] ?? ''));
         $pass = MysqlTlsPolicy::quote((string) ($conn['password'] ?? ''));

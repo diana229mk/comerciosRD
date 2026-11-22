@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static:
+    name: Validación estática y dependencias
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: intl, pdo_mysql, redis, gd, zip, bcmath
+          coverage: none
+          tools: composer:v2
+      - run: composer validate --strict --no-check-publish
+      - run: composer install --no-interaction --no-scripts --no-progress --prefer-dist
+      - name: composer audit (falla con cualquier aviso)
+        run: composer audit --locked
+      - name: php -l
+        run: find app bootstrap config database routes tests -name '*.php' -print0 | xargs -0 -n1 -P4 php -l > /dev/null
+      # Pint no es puerta todavía: 235 archivos heredados no cumplen el estilo (checklist P-07).
+      - name: Sintaxis de scripts de despliegue
+        run: |
+          for f in deploy-scripts/*.sh deploy/digitalocean/*.sh; do bash -n "$f"; done
+          sh -n docker/production-guard.sh docker/entrypoint.sh
+      - name: Production guard por roles
+        run: sh tests/deploy/production-guard-roles.sh
+      - name: Compose de producción renderiza y separa cuentas
+        run: |
+          d=$(mktemp -d)
+          printf 'DB_USERNAME=comercios_app\nDB_PASSWORD=x\nDB_DATABASE=comercios\nDB_HOST=db\nAPP_DOMAIN=ci.test\nACME_EMAIL=ci@ci.test\nREDIS_PASSWORD=abcdefghijklmnop12\n' > "$d/app.env"
+          printf 'DB_USERNAME=comercios_migrator\nDB_PASSWORD=y\n' > "$d/migrator.env"
+          printf 'PORTABILITY_DB_USERNAME=comercios_backup\nPORTABILITY_DB_PASSWORD=z\n' > "$d/backup.env"
+          COMERCIOS_ENV_FILE="$d/app.env" COMERCIOS_SECRETS_DIR="$d" COMERCIOS_IMAGE_TAG=ci \
+            docker compose -f compose.production.yaml --env-file "$d/app.env" \
+            --profile primary --profile migrate config --format json > "$d/out.json"
+          python3 - "$d/out.json" <<'PY'
+          import json, sys
+          s = json.load(open(sys.argv[1]))['services']
+          assert s['migrate']['environment']['DB_USERNAME'] == 'comercios_migrator'
+          assert s['app']['environment']['DB_USERNAME'] == 'comercios_app'
+          assert 'PORTABILITY_DB_USERNAME' not in s['app']['environment']
+          assert s['scheduler']['environment']['PORTABILITY_DB_USERNAME'] == 'comercios_backup'
+          assert s['app']['image'] == 'comercios-rd-php:ci'
+          print('compose de producción OK')
+          PY
+
+  frontend:
+    name: Dependencias JS
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm ci --ignore-scripts
+      - run: npm audit --omit=dev --audit-level=high
+      - run: npm run build
+
+  unit:
+    name: Suite Unit (Docker aislado)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs: static
+    steps:
+      - uses: actions/checkout@v4
+      - name: Secretos efímeros del entorno de pruebas
+        run: |
+          umask 077
+          printf 'COMERCIOS_TEST_MYSQL_ROOT_PASSWORD=%s\nCOMERCIOS_TEST_DB_PASSWORD=%s\n' \
+            "$(openssl rand -hex 24)" "$(openssl rand -hex 24)" > .env.testing.docker
+      - name: Build
+        run: docker compose --profile testing --env-file .env.testing.docker -f compose.testing.yaml build phpunit
+      - name: PHPUnit tests/Unit
+        run: docker compose --profile testing --env-file .env.testing.docker -f compose.testing.yaml run --rm -T phpunit ./vendor/bin/phpunit --colors=never tests/Unit
+      - name: Limpieza del proyecto de CI
+        if: always()
+        run: docker compose --profile testing --env-file .env.testing.docker -f compose.testing.yaml down -v
+
+  image-scan:
+    name: Imagen de producción y escaneo
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs: static
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build app
+        run: docker build --target app -t comercios-rd-php:ci .
+      - name: Trivy (CRITICAL/HIGH con parche disponible)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: comercios-rd-php:ci
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '1'

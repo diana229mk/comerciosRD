@@ -103,6 +103,25 @@ class PortabilityWorkflowTest extends TestCase
         $this->assertStringContainsString($error, $output);
     }
 
+    public function test_backup_uses_dedicated_backup_credentials_when_configured(): void
+    {
+        $this->app['config']->set('portability.db_username', 'comercios_data02_test');
+        $this->app['config']->set('portability.db_password', 'backup-secret');
+        $path = $this->exposedBackupCommand()->cnf();
+        $contents = (string) file_get_contents($path);
+        @unlink($path);
+        $this->assertStringContainsString('user="comercios_data02_test"', $contents);
+        $this->assertStringContainsString('password="backup-secret"', $contents);
+        $this->assertStringNotContainsString('comercios_storage_test', $contents);
+    }
+
+    public function test_backup_rejects_a_backup_user_without_password(): void
+    {
+        $this->app['config']->set('portability.db_username', 'comercios_data02_test');
+        $this->expectExceptionMessage('PORTABILITY_DB_PASSWORD es obligatorio');
+        $this->exposedBackupCommand()->cnf();
+    }
+
     public static function backupFailures(): array
     {
         return [
@@ -281,6 +300,17 @@ class PortabilityWorkflowTest extends TestCase
         $this->configureCommand($command, ['--dir' => $this->directory.'/backups']);
 
         return $command;
+    }
+
+    private function exposedBackupCommand(): PortabilityBackup
+    {
+        return new class extends PortabilityBackup
+        {
+            public function cnf(): string
+            {
+                return $this->mysqlCnf('mysqldump');
+            }
+        };
     }
 
     private function restoreCommand(string $from): PortabilityRestore
