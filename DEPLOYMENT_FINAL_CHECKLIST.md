@@ -61,7 +61,7 @@ reales; P2 se exige antes de escalar.
 | S-09 | Integridad financiera (cobros duplicados, sobrepago, idempotencia, concurrencia) | P0 | PASS | Suite de 2026-11-21 con imagen `20261121b`: Financial 50/201, SaleCredit 42/112, concurrencia CxC 16/16, cola contable 41/41. | — | — |
 | S-10 | Reembolsos, caja y asientos | P0 | HIST | Incluidos en Feature (295) y en las regresiones F1, INF-02 e INF-04. | — | — |
 | S-11 | Legado de INF-05 (ventas antiguas sin evento) y reconciliador | P1 | PEND | La auditoría lo deja PENDIENTE. Con una base nueva en DigitalOcean no hay legado si no se migran datos. | Decidir si se migran datos de `comercios_rd` | Definir la carga inicial (O-07). |
-| S-12 | HTTP-01: encabezados duplicados entre Nginx y el middleware | P2 | PEND | Severidad baja, sin bypass observado. | — | Verificarlo en staging (V-05). |
+| S-12 | HTTP-01: encabezados duplicados entre Nginx y el middleware | P2 | PREP | Commit `3b87eb2`: Nginx oculta los tres encabezados de FastCGI y los emite una sola vez desde el bloque `server`. `nginx -t` PASS en CI (run `45037978747`). | V-05 | Verificar en staging que cada encabezado aparece una vez (HTML, estáticos y errores). |
 | S-13 | TLS de MySQL | P0 | PASS | `MysqlTlsTest` 16/123 el 2026-11-22 (`TLS_AES_256_GCM_SHA384`, rechazo de CA incorrecta, de hostname discordante y de servidor sin TLS). | — | — |
 
 ## FASE 4 — Infraestructura y configuración
@@ -135,3 +135,4 @@ reales; P2 se exige antes de escalar.
 | 2026-11-22 | V-01: imagen `20261122` (`04724f14`), suite completa y `MysqlTlsTest` (`comercios-rd-tls-20261122`, conservado) | 485 PASS (2 omitidas LiveSmoke); TLS 16/123 PASS; `comercios_rd` 72 72 2 76 |
 | 2026-11-22 | Commits locales A–F (`5b93600`…`c8a9d6c`), sin push | 43 archivos; árbol limpio salvo `compose.data02-validation.yaml` |
 | 2026-11-22 | Push de la rama y PR #1 hacia `main`; corrección de CI (`c3c8912`) | CI 4/4 PASS (run `45037433737`); sin fusionar |
+| 2026-11-22 | HTTP-01 corregido en Nginx (`3b87eb2`) y `nginx -t` en CI | CI 4/4 PASS (run `45037978747`) |
