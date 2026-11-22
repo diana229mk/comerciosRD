@@ -29,9 +29,9 @@ reales; P2 se exige antes de escalar.
 | ID | Tarea | Prioridad | Estado | Evidencia | Bloqueo | Próxima acción |
 |---|---|---|---|---|---|---|
 | D-01 | Inventario Git y cambios pendientes | P0 | PASS | 43 cambios sin commit (2026-11-22), repartidos en los grupos A–F sin solapamientos y un archivo local excluido. La rama está alineada con `origin`. | — | — |
-| D-02 | Rama de integración frente a `main` | P0 | PEND | `main` solo tiene el commit inicial `908bd41` y está 10 commits por detrás. Las ramas `infra/do-prep`, `security/cleanup` y otras no tienen commits propios. | Push o PR remoto requiere autorización | Abrir un PR hacia `main` cuando los grupos A–E y F estén confirmados. |
+| D-02 | Rama de integración frente a `main` | P0 | PREP | PR #1 abierto hacia `main` (https://github.com/diana229mk/comerciosRD/pull/1); rama publicada. CI run `45037433737` (commit `c3c8912`, PR #1): 4/4 jobs PASS. | Fusión requiere autorización | Revisar y autorizar la fusión del PR #1. |
 | D-03 | Vulnerabilidades de dependencias (`composer audit --locked`) | P0 | PASS | 2026-11-22: `laravel/framework` 12.70.1 → 12.73.0 (solo ese paquete). `composer audit --locked`: sin avisos. Validado en V-01 (485 PASS). | — | — |
-| D-04 | Vulnerabilidades JS e imagen base | P1 | PREP | `npm audit --omit=dev`: 0 vulnerabilidades (2026-11-22). Falta el escaneo de la imagen. | — | Trivy en CI (P-03). |
+| D-04 | Vulnerabilidades JS e imagen base | P1 | PASS | `npm audit --omit=dev`: 0 vulnerabilidades. Trivy sobre la imagen de producción (`--target app`): sin CRITICAL/HIGH con parche, CI run `45037433737` (commit `c3c8912`, PR #1). | — | — |
 | D-05 | Alcance de e-CF | P0 | PASS | `ECF_ENABLED=false` está fijado en `compose.production.yaml` y lo exige `docker/production-guard.sh`. | — | — |
 
 ## FASE 2 — Integración de cambios pendientes
@@ -87,9 +87,9 @@ reales; P2 se exige antes de escalar.
 
 | ID | Tarea | Prioridad | Estado | Evidencia | Bloqueo | Próxima acción |
 |---|---|---|---|---|---|---|
-| P-01 | CI: validación, lint y pruebas en GitHub Actions | P1 | PREP | `.github/workflows/ci.yml`: composer validate y audit, `php -l`, sintaxis de los scripts, guard por roles, render del Compose de producción, npm audit y build, suite Unit en Docker aislado y Trivy. Pasos estáticos verificados en local; el workflow, no. | Push autorizado | Verificar la primera ejecución en el PR. |
+| P-01 | CI: validación, lint y pruebas en GitHub Actions | P1 | PASS | `.github/workflows/ci.yml`: CI run `45037433737` (commit `c3c8912`, PR #1): validación estática, dependencias JS, Unit en Docker aislado (127/264) y escaneo de imagen, 4/4 PASS. Primera ejecución falló por `restrict-test-user.sql` ignorado por git y `trivy-action@0.28.0` inexistente; corregido en `c3c8912` (Trivy fijado por SHA a v0.36.0). | — | — |
 | P-02 | Despliegue reproducible con imágenes etiquetadas por commit | P0 | PREP | `deploy-do.sh` exige checkout limpio, etiqueta `comercios-rd-{php,nginx}:<sha12>` y registra `deploy-state/current` y `previous`. | V-02 | Ensayar en staging. |
-| P-03 | Escaneo de vulnerabilidades de las imágenes | P1 | PREP | Trivy (CRITICAL/HIGH con parche) en CI. | P-01 | — |
+| P-03 | Escaneo de vulnerabilidades de las imágenes | P1 | PASS | Trivy v0.36.0 (fijado por SHA) en CI: CRITICAL/HIGH con parche, `exit-code: 1`; PASS en CI run `45037433737` (commit `c3c8912`, PR #1). | — | — |
 | P-04 | Respaldo obligatorio antes de migrar | P0 | PREP | `deploy-do.sh` ejecuta `portability:backup` (cuenta de backup) antes de `migrate`; si falla, no migra. También registra `schema-changed-<sha>`. | V-02 | Ensayar en staging. |
 | P-05 | Rollback de código separado del de esquema | P0 | PREP | `deploy-scripts/rollback-do.sh` (sin build, sin migraciones, conserva réplicas). Se niega si un despliegue posterior migró. Probado con un `docker` simulado: 6/6 casos. | V-07 | Ensayar en staging. |
 | P-07 | Pint como puerta de CI | P2 | PEND | 235 archivos heredados no cumplen el estilo. | — | Reformatear en un commit aislado, sin cambios de lógica. |
@@ -134,3 +134,4 @@ reales; P2 se exige antes de escalar.
 | 2026-11-22 | Build `20261122`: fallo por `mysql-accounts.sql.template` (filtro `*.sql*`); renombrado a `mysql-accounts.template` | Corregido; nada creado |
 | 2026-11-22 | V-01: imagen `20261122` (`04724f14`), suite completa y `MysqlTlsTest` (`comercios-rd-tls-20261122`, conservado) | 485 PASS (2 omitidas LiveSmoke); TLS 16/123 PASS; `comercios_rd` 72 72 2 76 |
 | 2026-11-22 | Commits locales A–F (`5b93600`…`c8a9d6c`), sin push | 43 archivos; árbol limpio salvo `compose.data02-validation.yaml` |
+| 2026-11-22 | Push de la rama y PR #1 hacia `main`; corrección de CI (`c3c8912`) | CI 4/4 PASS (run `45037433737`); sin fusionar |
