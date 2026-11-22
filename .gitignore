@@ -25,6 +25,8 @@
 *.db
 *.sql
 *.sql.gz
+# Script de privilegios del MySQL de pruebas (sin secretos); compose.testing.yaml lo monta.
+!docker/testing/restrict-test-user.sql
 *.pem
 *.p12
 *.pfx
